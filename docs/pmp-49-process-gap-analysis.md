@@ -1,7 +1,7 @@
 # PMP 49-Process Compliance Review
 
 ## Scope Reviewed
-- File reviewed: `docs/hemispheres-fnb-requirements.md`
+- File reviewed: `docs/hemi-fnb-requirements.md`
 - Review objective: verify whether the document addresses the **49 PMBOK (6th edition) project management processes**.
 
 ## Review Result
@@ -28,6 +28,6 @@ The current file does **not** define process-level expectations for:
 
 ## Remediation Delivered
 To satisfy the requirement, the following additional documentation is provided:
-- `docs/pmp-49-process-framework-for-hemispheres-fnb.md`
+- `docs/pmp-49-process-framework-for-hemi-fnb.md`
 
-This remediation document enumerates all 49 processes and tailors each process to the Hemispheres FnB application initiative.
+This remediation document enumerates all 49 processes and tailors each process to the Hemi FnB application initiative.

@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Hemi.Application</RootNamespace>
+    <AssemblyName>Hemi.Application</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Domain/Hemi.Domain.csproj" />
+  </ItemGroup>
+</Project>

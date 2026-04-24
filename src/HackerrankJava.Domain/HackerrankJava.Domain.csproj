@@ -1,6 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <RootNamespace>HackerrankJava.Domain</RootNamespace>
-    <AssemblyName>HackerrankJava.Domain</AssemblyName>
-  </PropertyGroup>
-</Project>
