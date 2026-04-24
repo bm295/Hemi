@@ -12,7 +12,9 @@ builder.Services.AddSingleton<InMemoryOrderAdapter>();
 builder.Services.AddSingleton<InMemoryReservationAdapter>();
 builder.Services.AddSingleton<InMemoryPaymentAdapter>();
 builder.Services.AddSingleton<InMemoryInventoryAdapter>();
-builder.Services.AddSingleton<InMemorySagaStateAdapter>();
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
+    ?? "Server=localhost;Database=HemiFnb;Trusted_Connection=True;TrustServerCertificate=True;";
+builder.Services.AddSingleton(new SqlServerSagaStateAdapter(connectionString));
 
 builder.Services.AddSingleton<IRestaurantQueryPort>(sp => sp.GetRequiredService<InMemoryRestaurantAdapter>());
 builder.Services.AddSingleton<ITableQueryPort>(sp => sp.GetRequiredService<InMemoryTableAdapter>());
@@ -25,8 +27,8 @@ builder.Services.AddSingleton<IPaymentQueryPort>(sp => sp.GetRequiredService<InM
 builder.Services.AddSingleton<IPaymentCommandPort>(sp => sp.GetRequiredService<InMemoryPaymentAdapter>());
 builder.Services.AddSingleton<IInventoryQueryPort>(sp => sp.GetRequiredService<InMemoryInventoryAdapter>());
 builder.Services.AddSingleton<IInventoryCommandPort>(sp => sp.GetRequiredService<InMemoryInventoryAdapter>());
-builder.Services.AddSingleton<ISagaStateQueryPort>(sp => sp.GetRequiredService<InMemorySagaStateAdapter>());
-builder.Services.AddSingleton<ISagaStateCommandPort>(sp => sp.GetRequiredService<InMemorySagaStateAdapter>());
+builder.Services.AddSingleton<ISagaStateQueryPort>(sp => sp.GetRequiredService<SqlServerSagaStateAdapter>());
+builder.Services.AddSingleton<ISagaStateCommandPort>(sp => sp.GetRequiredService<SqlServerSagaStateAdapter>());
 
 builder.Services.AddSingleton<OrderFulfillmentSagaOrchestrator>();
 builder.Services.AddSingleton<FnbManagementService>();
