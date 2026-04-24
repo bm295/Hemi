@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Hemi.Domain</RootNamespace>
+    <AssemblyName>Hemi.Domain</AssemblyName>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Hemi.Infrastructure</RootNamespace>
+    <AssemblyName>Hemi.Infrastructure</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Application/Hemi.Application.csproj" />
+  </ItemGroup>
+</Project>

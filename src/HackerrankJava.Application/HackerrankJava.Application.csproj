@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <RootNamespace>HackerrankJava.Application</RootNamespace>
-    <AssemblyName>HackerrankJava.Application</AssemblyName>
-  </PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="../HackerrankJava.Domain/HackerrankJava.Domain.csproj" />
-  </ItemGroup>
-</Project>

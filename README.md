@@ -1,10 +1,10 @@
-# Hemispheres FnB Management Application
+# Hemi FnB Management Application
 
-This repository now contains a layered C# application for **Hemispheres Steak & Seafood Grill (Sheraton Hanoi)**.
+This repository now contains a layered C# application for **Hemi Steak & Seafood Grill**.
 
 ## Restaurant scope
 
-- Venue: Hemispheres Steak & Seafood Grill — Sheraton Hanoi
+- Venue: Hemi Steak & Seafood Grill
 - Capacity target: approximately **60–80 seats**
 
 ## Tech stack
@@ -29,6 +29,7 @@ This repository now contains a layered C# application for **Hemispheres Steak & 
   - process payment
   - deduct inventory on close
   - close order
+- Saga-based orchestration endpoint to fulfill an order (kitchen -> payment -> inventory -> close) with compensation on failure
 - Reservation creation and upcoming reservation listing
 - Inventory snapshot endpoint
 - Basic sales report endpoint
@@ -37,7 +38,7 @@ This repository now contains a layered C# application for **Hemispheres Steak & 
 ## Run
 
 ```bash
-dotnet run --project src/HackerrankJava.Presentation/HackerrankJava.Presentation.csproj
+dotnet run --project src/Presentation/Hemi.Presentation.csproj
 ```
 
 The API starts locally and exposes endpoints such as:

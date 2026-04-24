@@ -1,13 +1,17 @@
-# Hemispheres Restaurant Management System — Hexagonal Architecture Review
+# Hemi Restaurant Management System — Hexagonal Architecture Review
 
 ## 1. Repository overview
 
-- The repository includes a .NET solution (`HackerrankJava.sln`) plus unrelated Java practice files in `java/`; the FnB implementation is the C# code under `src/`.
+- The repository includes a .NET solution (`Hemi.sln`); the FnB implementation is the C# code under `src/`.
 - The C# projects remain separated as:
-  - `HackerrankJava.Domain`
-  - `HackerrankJava.Application`
-  - `HackerrankJava.Infrastructure`
-  - `HackerrankJava.Presentation`
+  - `Hemi.Domain`
+  - `Hemi.Application`
+  - `Hemi.Infrastructure`
+  - `Hemi.Presentation`
+- Hexagonal boundaries are now explicit in the application layer with:
+  - `Ports/` for outbound port contracts
+  - `UseCases/` for orchestration/use-case services
+  - `Contracts/` for application DTOs
 - Global build settings target `.NET 10` and `C# 14` through `Directory.Build.props`.
 - API endpoints support profile/tables/menu, full order lifecycle, reservation operations, inventory view, sales reporting, and external food-app order intake.
 
@@ -30,7 +34,7 @@
 
 ### What is compliant
 
-- **Ports in Application**: ports are defined in `HackerrankJava.Application` and are technology-agnostic.
+- **Ports in Application**: ports are defined in `Hemi.Application` and are technology-agnostic.
 - **Adapters in Infrastructure**: distinct adapters implement outbound concerns for orders, reservations, payments, inventory, tables, menu, and profile.
 - **Framework isolation**: ASP.NET and DI remain in Presentation.
 - **Inward dependency direction**: Presentation/Infrastructure depend on Application; Application depends on Domain.
