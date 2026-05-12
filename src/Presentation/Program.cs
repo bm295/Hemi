@@ -1,4 +1,6 @@
 using Hemi.Application;
+using Hemi.Application.Workflows.Abstractions;
+using Hemi.Application.Workflows.Execution;
 using Hemi.Domain;
 using Hemi.Infrastructure;
 
@@ -33,9 +35,13 @@ builder.Services.AddSingleton<ISagaStateCommandPort>(sp => sp.GetRequiredService
 builder.Services.AddSingleton<OrderFulfillmentSagaOrchestrator>();
 builder.Services.AddSingleton<FnbManagementService>();
 
+builder.Services.AddScoped<IWorkflowEngine, WorkflowEngine>();
+builder.Services.AddScoped<IWorkflowDispatcher, WorkflowDispatcher>();
+builder.Services.AddSingleton<IRetryPolicyProvider, RetryPolicyProvider>();
+
 var app = builder.Build();
 
-app.MapGet("/", async (FnbManagementService service, CancellationToken cancellationToken) =>
+/*app.MapGet("/", async (FnbManagementService service, CancellationToken cancellationToken) =>
 {
     var profile = await service.GetProfileAsync(cancellationToken);
     return Results.Ok(new
@@ -59,7 +65,7 @@ app.MapGet("/", async (FnbManagementService service, CancellationToken cancellat
             "/integrations/food-app/orders"
         ]
     });
-});
+});*/
 
 app.MapGet("/tables", async (FnbManagementService service, CancellationToken cancellationToken) =>
     Results.Ok(await service.GetTablesAsync(cancellationToken)));
