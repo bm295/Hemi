@@ -1,6 +1,7 @@
 using Hemi.Application;
 using Hemi.Application.Workflows.Abstractions;
 using Hemi.Application.Workflows.Execution;
+using Hemi.Application.Workflows.Registry;
 using Hemi.Domain;
 using Hemi.Domain.Workflows;
 using Hemi.Infrastructure;
@@ -38,6 +39,8 @@ builder.Services.AddSingleton<FnbManagementService>();
 
 builder.Services.AddScoped<IWorkflowEngine, WorkflowEngine>();
 builder.Services.AddScoped<IWorkflowDispatcher, WorkflowDispatcher>();
+builder.Services.AddSingleton<IWorkflowRegistry>(
+    WorkflowRegistry.RegisterAllWorkflows());
 builder.Services.AddSingleton(new WorkflowPolicyRegistration(
     WorkflowIds.OrderFulfillment,
     WorkflowPolicies.Default));
