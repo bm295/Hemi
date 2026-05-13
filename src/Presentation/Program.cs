@@ -7,6 +7,9 @@ using Hemi.Application.Workflows.Registry;
 using Hemi.Domain;
 using Hemi.Domain.Workflows;
 using Hemi.Infrastructure;
+using Hemi.Infrastructure.Messaging;
+using Hemi.Presentation.BackgroundWorkers;
+using Hemi.Presentation.Endpoints;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -61,6 +64,9 @@ builder.Services.AddSingleton(new WorkflowPolicyRegistration(
     WorkflowPolicies.Default));
 builder.Services.AddSingleton<IRetryPolicyProvider, RetryPolicyProvider>();
 builder.Services.AddSingleton<IWorkflowEventPublisher, NoOpWorkflowEventPublisher>();
+builder.Services.AddSingleton<WorkflowCommandQueue>();
+builder.Services.AddScoped<WorkflowCommandSubscriber>();
+builder.Services.AddHostedService<WorkflowWorkerService>();
 
 var app = builder.Build();
 
@@ -250,6 +256,8 @@ app.MapPost("/integrations/food-app/orders", async (IntegrateFoodAppOrderApiRequ
         return Results.BadRequest(new { error = ex.Message });
     }
 });
+
+app.MapWorkflowsEndpoints();
 
 app.Run();
 
