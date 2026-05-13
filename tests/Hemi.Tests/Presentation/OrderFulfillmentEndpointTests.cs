@@ -79,6 +79,13 @@ public sealed class OrderFulfillmentEndpointTests(
         Assert.Equal(orderId.ToString("D"), root.GetProperty("correlationId").GetString());
         Assert.Equal(idempotencyKey, root.GetProperty("idempotencyKey").GetString());
         Assert.Equal((int)WorkflowState.Pending, root.GetProperty("state").GetInt32());
+        Assert.NotEqual(Guid.Empty, root.GetProperty("workflowInstanceId").GetGuid());
+        Assert.NotEqual(Guid.Empty, root.GetProperty("commandId").GetGuid());
+        Assert.NotEqual(default, root.GetProperty("acceptedAtUtc").GetDateTimeOffset());
+        Assert.NotEqual(default, root.GetProperty("updatedAtUtc").GetDateTimeOffset());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("completedAtUtc").ValueKind);
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("lastError").ValueKind);
+        Assert.Empty(root.GetProperty("steps").EnumerateArray());
 
         var instance = await store.GetInstanceByCorrelationAsync(
             WorkflowIds.OrderFulfillment,
@@ -206,6 +213,127 @@ public sealed class OrderFulfillmentEndpointTests(
     }
 
     [Fact]
+    public async Task Get_workflow_instance_returns_durable_status_with_step_summaries()
+    {
+        var client = factory.CreateClient();
+        var store = factory.WorkflowInstanceStore;
+        var logStore = factory.WorkflowExecutionLogStore;
+        var correlationId = Guid.NewGuid().ToString("D");
+
+        using var startResponse = await client.PostAsJsonAsync(
+            "/workflows/",
+            new StartWorkflowCommand(
+                WorkflowIds.OrderFulfillment,
+                correlationId,
+                new Dictionary<string, object?>
+                {
+                    ["marker"] = "durable-status"
+                },
+                $"workflow-test-{Guid.NewGuid():N}",
+                "endpoint-tests"));
+
+        Assert.Equal(HttpStatusCode.Accepted, startResponse.StatusCode);
+
+        var instance = await store.GetInstanceByCorrelationAsync(
+            WorkflowIds.OrderFulfillment,
+            correlationId);
+
+        Assert.NotNull(instance);
+        logStore.AddAttempt(new WorkflowStepAttemptRecord(
+            Guid.NewGuid(),
+            instance.Id,
+            "CaptureOrderPaymentStep",
+            StepOrder: 2,
+            WorkflowStepAttemptStatus.Succeeded,
+            Attempt: 1,
+            instance.CommandId,
+            ErrorMessage: null,
+            StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-3),
+            CompletedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-2),
+            CompensatedAtUtc: null));
+
+        using var statusResponse = await client.GetAsync(
+            $"/workflows/{WorkflowIds.OrderFulfillment}/instances/{correlationId}");
+
+        Assert.Equal(HttpStatusCode.OK, statusResponse.StatusCode);
+
+        using var payload = await ReadJsonAsync(statusResponse);
+        var root = payload.RootElement;
+
+        Assert.Equal(instance.Id, root.GetProperty("workflowInstanceId").GetGuid());
+        Assert.Equal(instance.CommandId, root.GetProperty("commandId").GetGuid());
+        Assert.Equal(WorkflowIds.OrderFulfillment, root.GetProperty("workflowId").GetString());
+        Assert.Equal(correlationId, root.GetProperty("correlationId").GetString());
+        Assert.Equal((int)WorkflowState.Pending, root.GetProperty("state").GetInt32());
+        Assert.Equal("durable-status", root.GetProperty("items").GetProperty("marker").GetString());
+
+        var step = Assert.Single(root.GetProperty("steps").EnumerateArray());
+        Assert.Equal(2, step.GetProperty("order").GetInt32());
+        Assert.Equal("CaptureOrderPaymentStep", step.GetProperty("name").GetString());
+        Assert.Equal((int)WorkflowStepAttemptStatus.Succeeded, step.GetProperty("status").GetInt32());
+        Assert.Equal(1, step.GetProperty("attempt").GetInt32());
+    }
+
+    [Fact]
+    public async Task Get_fulfillment_saga_returns_durable_workflow_status_when_instance_exists()
+    {
+        var client = factory.CreateClient();
+        var store = factory.WorkflowInstanceStore;
+        var logStore = factory.WorkflowExecutionLogStore;
+        var orderId = Guid.NewGuid();
+
+        using var startResponse = await client.PostAsJsonAsync(
+            $"/orders/{orderId:D}/fulfillment-saga",
+            new
+            {
+                method = PaymentMethod.Card,
+                amount = 42.75m,
+                idempotencyKey = $"order-fulfillment-test-{Guid.NewGuid():N}",
+                requestedBy = "endpoint-tests"
+            });
+
+        Assert.Equal(HttpStatusCode.Accepted, startResponse.StatusCode);
+
+        var instance = await store.GetInstanceByCorrelationAsync(
+            WorkflowIds.OrderFulfillment,
+            orderId.ToString("D"));
+
+        Assert.NotNull(instance);
+        logStore.AddAttempt(new WorkflowStepAttemptRecord(
+            Guid.NewGuid(),
+            instance.Id,
+            "SendOrderToKitchenStep",
+            StepOrder: 1,
+            WorkflowStepAttemptStatus.Running,
+            Attempt: 1,
+            instance.CommandId,
+            ErrorMessage: null,
+            StartedAtUtc: DateTimeOffset.UtcNow,
+            CompletedAtUtc: null,
+            CompensatedAtUtc: null));
+
+        using var statusResponse = await client.GetAsync(
+            $"/orders/{orderId:D}/fulfillment-saga");
+
+        Assert.Equal(HttpStatusCode.OK, statusResponse.StatusCode);
+
+        using var payload = await ReadJsonAsync(statusResponse);
+        var root = payload.RootElement;
+
+        Assert.Equal(instance.Id, root.GetProperty("workflowInstanceId").GetGuid());
+        Assert.Equal(instance.CommandId, root.GetProperty("commandId").GetGuid());
+        Assert.Equal(WorkflowIds.OrderFulfillment, root.GetProperty("workflowId").GetString());
+        Assert.Equal(orderId.ToString("D"), root.GetProperty("correlationId").GetString());
+        Assert.Equal((int)WorkflowState.Pending, root.GetProperty("state").GetInt32());
+        Assert.Equal(
+            orderId.ToString("D"),
+            root.GetProperty("items")
+                .GetProperty(OrderFulfillmentWorkflowContext.OrderId)
+                .GetString());
+        Assert.Single(root.GetProperty("steps").EnumerateArray());
+    }
+
+    [Fact]
     public async Task Get_workflows_lists_order_fulfillment_workflow()
     {
         var client = factory.CreateClient();
@@ -261,6 +389,9 @@ public sealed class OrderFulfillmentEndpointTests(
         public RecordingWorkflowInstanceStore WorkflowInstanceStore =>
             Services.GetRequiredService<RecordingWorkflowInstanceStore>();
 
+        public RecordingWorkflowExecutionLogStore WorkflowExecutionLogStore =>
+            Services.GetRequiredService<RecordingWorkflowExecutionLogStore>();
+
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Testing");
@@ -268,9 +399,13 @@ public sealed class OrderFulfillmentEndpointTests(
             {
                 services.RemoveAll<IHostedService>();
                 services.RemoveAll<IWorkflowInstanceStore>();
+                services.RemoveAll<IWorkflowExecutionLogStore>();
                 services.AddSingleton<RecordingWorkflowInstanceStore>();
                 services.AddSingleton<IWorkflowInstanceStore>(sp =>
                     sp.GetRequiredService<RecordingWorkflowInstanceStore>());
+                services.AddSingleton<RecordingWorkflowExecutionLogStore>();
+                services.AddSingleton<IWorkflowExecutionLogStore>(sp =>
+                    sp.GetRequiredService<RecordingWorkflowExecutionLogStore>());
             });
         }
     }
@@ -430,5 +565,71 @@ public sealed class OrderFulfillmentEndpointTests(
                 instance.RequestHash,
                 requestHash,
                 StringComparison.Ordinal);
+    }
+
+    public sealed class RecordingWorkflowExecutionLogStore : IWorkflowExecutionLogStore
+    {
+        private readonly object _sync = new();
+        private readonly List<WorkflowStepAttemptRecord> _attempts = [];
+
+        public void AddAttempt(WorkflowStepAttemptRecord attempt)
+        {
+            lock (_sync)
+            {
+                _attempts.Add(attempt);
+            }
+        }
+
+        public Task<IReadOnlyCollection<WorkflowStepAttemptRecord>> GetStepAttemptsAsync(
+            Guid workflowInstanceId,
+            CancellationToken cancellationToken = default)
+        {
+            lock (_sync)
+            {
+                return Task.FromResult<IReadOnlyCollection<WorkflowStepAttemptRecord>>(
+                    _attempts
+                        .Where(attempt => attempt.WorkflowInstanceId == workflowInstanceId)
+                        .ToArray());
+            }
+        }
+
+        public Task<WorkflowStepAttemptRecord> MarkStepRunningAsync(
+            WorkflowStepAttemptStart request,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public Task<bool> MarkStepSucceededAsync(
+            Guid workflowInstanceId,
+            int stepOrder,
+            int attempt,
+            DateTimeOffset completedAtUtc,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public Task<bool> MarkStepFailedAsync(
+            Guid workflowInstanceId,
+            int stepOrder,
+            int attempt,
+            string errorMessage,
+            DateTimeOffset completedAtUtc,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public Task<bool> MarkStepCompensatedAsync(
+            Guid workflowInstanceId,
+            int stepOrder,
+            int attempt,
+            DateTimeOffset compensatedAtUtc,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public Task<bool> MarkStepCompensationFailedAsync(
+            Guid workflowInstanceId,
+            int stepOrder,
+            int attempt,
+            string errorMessage,
+            DateTimeOffset compensatedAtUtc,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
     }
 }

@@ -39,6 +39,35 @@ public static class WorkflowsEndpoints
             return Results.Ok(ToResponse(workflowDefinition));
         });
 
+        group.MapGet("/{workflowId}/instances/{correlationId}", async (
+            string workflowId,
+            string correlationId,
+            IWorkflowInstanceStore workflowInstanceStore,
+            IWorkflowExecutionLogStore workflowExecutionLogStore,
+            CancellationToken cancellationToken) =>
+        {
+            var instance = await workflowInstanceStore.GetInstanceByCorrelationAsync(
+                workflowId,
+                correlationId,
+                cancellationToken);
+
+            if (instance is null)
+            {
+                return Results.NotFound(new WorkflowErrorResponse(
+                    $"Workflow instance '{workflowId}/{correlationId}' was not found.",
+                    Code: "workflow.instance_not_found",
+                    WorkflowId: workflowId,
+                    CorrelationId: correlationId));
+            }
+
+            var response = await WorkflowStatusMapper.ToStatusResponseAsync(
+                instance,
+                workflowExecutionLogStore,
+                cancellationToken);
+
+            return Results.Ok(response);
+        });
+
         group.MapPost("/", async (
             StartWorkflowCommand request,
             WorkflowCommandQueue commandQueue,
@@ -63,7 +92,7 @@ public static class WorkflowsEndpoints
                     cancellationToken);
 
                 return Results.Accepted(
-                    $"/workflows/{response.WorkflowId}",
+                    $"/workflows/{response.WorkflowId}/instances/{response.CorrelationId}",
                     response);
             }
             catch (ArgumentException ex)

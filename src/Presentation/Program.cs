@@ -263,7 +263,7 @@ app.MapPost("/orders/{orderId:guid}/fulfillment-saga", async (
             cancellationToken);
 
         return Results.Accepted(
-            $"/workflows/{response.WorkflowId}",
+            $"/workflows/{response.WorkflowId}/instances/{response.CorrelationId}",
             response);
     }
     catch (ArgumentException ex)
@@ -292,8 +292,29 @@ app.MapPost("/orders/{orderId:guid}/fulfillment-saga", async (
     }
 });
 
-app.MapGet("/orders/{orderId:guid}/fulfillment-saga", async (Guid orderId, FnbManagementService service, CancellationToken cancellationToken) =>
+app.MapGet("/orders/{orderId:guid}/fulfillment-saga", async (
+    Guid orderId,
+    IWorkflowInstanceStore workflowInstanceStore,
+    IWorkflowExecutionLogStore workflowExecutionLogStore,
+    FnbManagementService service,
+    CancellationToken cancellationToken) =>
 {
+    var correlationId = orderId.ToString("D");
+    var instance = await workflowInstanceStore.GetInstanceByCorrelationAsync(
+        WorkflowIds.OrderFulfillment,
+        correlationId,
+        cancellationToken);
+
+    if (instance is not null)
+    {
+        var response = await WorkflowStatusMapper.ToStatusResponseAsync(
+            instance,
+            workflowExecutionLogStore,
+            cancellationToken);
+
+        return Results.Ok(response);
+    }
+
     var saga = await service.GetOrderFulfillmentSagaStateAsync(orderId, cancellationToken);
     return saga is null
         ? Results.NotFound(new { error = "Saga state not found for this order." })

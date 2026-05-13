@@ -1,13 +1,19 @@
+using Hemi.Application.Workflows.Abstractions;
 using Hemi.Domain.Workflows;
 
 namespace Hemi.Application.Workflows.Contracts;
 
 public sealed record WorkflowAcceptedResponse(
+    Guid WorkflowInstanceId,
     Guid CommandId,
     string WorkflowId,
     string CorrelationId,
     WorkflowState State,
     DateTimeOffset AcceptedAtUtc,
+    DateTimeOffset UpdatedAtUtc,
+    DateTimeOffset? CompletedAtUtc,
+    string? LastError,
+    IReadOnlyCollection<WorkflowStepSummaryResponse> Steps,
     string? IdempotencyKey = null);
 
 public sealed record WorkflowExecutionResponse(
@@ -22,12 +28,28 @@ public sealed record WorkflowExecutionResponse(
     DateTimeOffset CompletedAtUtc);
 
 public sealed record WorkflowStatusResponse(
+    Guid WorkflowInstanceId,
+    Guid CommandId,
     string WorkflowId,
     string CorrelationId,
     WorkflowState State,
-    IReadOnlyDictionary<string, object?> Items,
+    DateTimeOffset AcceptedAtUtc,
+    DateTimeOffset UpdatedAtUtc,
+    DateTimeOffset? CompletedAtUtc,
     string? LastError,
-    DateTimeOffset UpdatedAtUtc);
+    IReadOnlyCollection<WorkflowStepSummaryResponse> Steps,
+    IReadOnlyDictionary<string, object?> Items,
+    string? IdempotencyKey = null);
+
+public sealed record WorkflowStepSummaryResponse(
+    int Order,
+    string Name,
+    WorkflowStepAttemptStatus Status,
+    int Attempt,
+    string? ErrorMessage,
+    DateTimeOffset? StartedAtUtc,
+    DateTimeOffset? CompletedAtUtc,
+    DateTimeOffset? CompensatedAtUtc);
 
 public sealed record WorkflowEventResponse(
     string EventName,

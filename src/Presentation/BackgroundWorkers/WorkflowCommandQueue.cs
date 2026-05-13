@@ -98,11 +98,16 @@ public sealed class WorkflowCommandQueue(
     private static WorkflowAcceptedResponse ToAcceptedResponse(
         WorkflowInstanceRecord instance) =>
         new(
+            instance.Id,
             instance.CommandId,
             instance.WorkflowId,
             instance.CorrelationId,
             instance.State,
             instance.CreatedAtUtc,
+            instance.UpdatedAtUtc,
+            instance.CompletedAtUtc,
+            instance.LastError,
+            [],
             instance.IdempotencyKey);
 
     private static string Hash(StartWorkflowCommand request)
