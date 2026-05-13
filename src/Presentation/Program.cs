@@ -48,8 +48,14 @@ builder.Services.AddSingleton<ISagaStateCommandPort>(sp => sp.GetRequiredService
 builder.Services.AddSingleton<OrderFulfillmentSagaOrchestrator>();
 builder.Services.AddSingleton<FnbManagementService>();
 
-builder.Services.AddSingleton(new WorkflowInstanceRepository(connectionString));
-builder.Services.AddSingleton(new WorkflowExecutionLogRepository(connectionString));
+builder.Services.AddSingleton(_ => new WorkflowInstanceRepository(connectionString));
+builder.Services.AddSingleton<IWorkflowInstanceStore>(sp =>
+    sp.GetRequiredService<WorkflowInstanceRepository>());
+builder.Services.AddSingleton(_ => new WorkflowExecutionLogRepository(connectionString));
+builder.Services.AddSingleton<IWorkflowExecutionLogStore>(sp =>
+    sp.GetRequiredService<WorkflowExecutionLogRepository>());
+builder.Services.AddSingleton<IWorkflowOutboxStore>(sp =>
+    sp.GetRequiredService<WorkflowExecutionLogRepository>());
 builder.Services.AddSingleton<WorkflowMetrics>();
 builder.Services.AddSingleton<WorkflowTracing>();
 

@@ -2,6 +2,7 @@ IF OBJECT_ID(N'dbo.WorkflowInstance', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.WorkflowInstance (
         Id UNIQUEIDENTIFIER NOT NULL PRIMARY KEY,
+        CommandId UNIQUEIDENTIFIER NOT NULL CONSTRAINT DF_WorkflowInstance_CommandId DEFAULT NEWID(),
         WorkflowId NVARCHAR(128) NOT NULL,
         WorkflowName NVARCHAR(128) NOT NULL,
         CorrelationId NVARCHAR(128) NOT NULL,
@@ -11,8 +12,73 @@ BEGIN
         Version INT NOT NULL,
         CreatedAtUtc DATETIMEOFFSET NOT NULL,
         UpdatedAtUtc DATETIMEOFFSET NOT NULL,
-        CompletedAtUtc DATETIMEOFFSET NULL
+        CompletedAtUtc DATETIMEOFFSET NULL,
+        IdempotencyKey NVARCHAR(256) NULL,
+        RequestHash CHAR(64) NULL,
+        RequestedBy NVARCHAR(128) NULL,
+        Attempt INT NOT NULL CONSTRAINT DF_WorkflowInstance_Attempt DEFAULT 0,
+        NextAttemptAtUtc DATETIMEOFFSET NULL,
+        LeaseOwner NVARCHAR(128) NULL,
+        LeaseUntilUtc DATETIMEOFFSET NULL
     );
+END;
+GO
+
+IF COL_LENGTH(N'dbo.WorkflowInstance', N'CommandId') IS NULL
+BEGIN
+    ALTER TABLE dbo.WorkflowInstance
+        ADD CommandId UNIQUEIDENTIFIER NOT NULL
+            CONSTRAINT DF_WorkflowInstance_CommandId DEFAULT NEWID() WITH VALUES;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.WorkflowInstance', N'IdempotencyKey') IS NULL
+BEGIN
+    ALTER TABLE dbo.WorkflowInstance
+        ADD IdempotencyKey NVARCHAR(256) NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.WorkflowInstance', N'RequestHash') IS NULL
+BEGIN
+    ALTER TABLE dbo.WorkflowInstance
+        ADD RequestHash CHAR(64) NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.WorkflowInstance', N'RequestedBy') IS NULL
+BEGIN
+    ALTER TABLE dbo.WorkflowInstance
+        ADD RequestedBy NVARCHAR(128) NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.WorkflowInstance', N'Attempt') IS NULL
+BEGIN
+    ALTER TABLE dbo.WorkflowInstance
+        ADD Attempt INT NOT NULL
+            CONSTRAINT DF_WorkflowInstance_Attempt DEFAULT 0 WITH VALUES;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.WorkflowInstance', N'NextAttemptAtUtc') IS NULL
+BEGIN
+    ALTER TABLE dbo.WorkflowInstance
+        ADD NextAttemptAtUtc DATETIMEOFFSET NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.WorkflowInstance', N'LeaseOwner') IS NULL
+BEGIN
+    ALTER TABLE dbo.WorkflowInstance
+        ADD LeaseOwner NVARCHAR(128) NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.WorkflowInstance', N'LeaseUntilUtc') IS NULL
+BEGIN
+    ALTER TABLE dbo.WorkflowInstance
+        ADD LeaseUntilUtc DATETIMEOFFSET NULL;
 END;
 GO
 
@@ -23,10 +89,25 @@ BEGIN
 END;
 GO
 
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'UX_WorkflowInstance_IdempotencyKey' AND object_id = OBJECT_ID(N'dbo.WorkflowInstance'))
+BEGIN
+    CREATE UNIQUE INDEX UX_WorkflowInstance_IdempotencyKey
+        ON dbo.WorkflowInstance(IdempotencyKey)
+        WHERE IdempotencyKey IS NOT NULL;
+END;
+GO
+
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_WorkflowInstance_State_UpdatedAtUtc' AND object_id = OBJECT_ID(N'dbo.WorkflowInstance'))
 BEGIN
     CREATE INDEX IX_WorkflowInstance_State_UpdatedAtUtc
         ON dbo.WorkflowInstance(State, UpdatedAtUtc);
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_WorkflowInstance_State_NextAttempt_Lease' AND object_id = OBJECT_ID(N'dbo.WorkflowInstance'))
+BEGIN
+    CREATE INDEX IX_WorkflowInstance_State_NextAttempt_Lease
+        ON dbo.WorkflowInstance(State, NextAttemptAtUtc, LeaseUntilUtc);
 END;
 GO
 
@@ -72,6 +153,7 @@ BEGIN
         MessageType NVARCHAR(128) NOT NULL,
         Destination NVARCHAR(256) NOT NULL,
         PayloadJson NVARCHAR(MAX) NOT NULL,
+        HeadersJson NVARCHAR(MAX) NOT NULL CONSTRAINT DF_WorkflowOutboxMessage_HeadersJson DEFAULT N'{}',
         Status NVARCHAR(32) NOT NULL,
         RetryCount INT NOT NULL,
         ErrorMessage NVARCHAR(1024) NULL,
@@ -82,6 +164,14 @@ BEGIN
         CONSTRAINT FK_WorkflowOutboxMessage_WorkflowInstance
             FOREIGN KEY (WorkflowInstanceId) REFERENCES dbo.WorkflowInstance(Id)
     );
+END;
+GO
+
+IF COL_LENGTH(N'dbo.WorkflowOutboxMessage', N'HeadersJson') IS NULL
+BEGIN
+    ALTER TABLE dbo.WorkflowOutboxMessage
+        ADD HeadersJson NVARCHAR(MAX) NOT NULL
+            CONSTRAINT DF_WorkflowOutboxMessage_HeadersJson DEFAULT N'{}' WITH VALUES;
 END;
 GO
 

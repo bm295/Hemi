@@ -1,11 +1,14 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Hemi.Application.Workflows.Abstractions;
 using Hemi.Domain;
 using Hemi.Domain.Workflows;
+using Hemi.Infrastructure.WorkflowPersistence.Repositories;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 
@@ -92,6 +95,20 @@ public sealed class OrderFulfillmentEndpointTests(
         Assert.Contains(
             payload.RootElement.EnumerateArray(),
             workflow => workflow.GetProperty("workflowId").GetString() == WorkflowIds.OrderFulfillment);
+    }
+
+    [Fact]
+    public void Workflow_persistence_abstractions_resolve_to_sql_server_repositories()
+    {
+        using var scope = factory.Services.CreateScope();
+        var services = scope.ServiceProvider;
+
+        Assert.IsType<WorkflowInstanceRepository>(
+            services.GetRequiredService<IWorkflowInstanceStore>());
+        Assert.IsType<WorkflowExecutionLogRepository>(
+            services.GetRequiredService<IWorkflowExecutionLogStore>());
+        Assert.IsType<WorkflowExecutionLogRepository>(
+            services.GetRequiredService<IWorkflowOutboxStore>());
     }
 
     private static async Task<HttpResponseMessage> SendWithIdempotencyKeyAsync(

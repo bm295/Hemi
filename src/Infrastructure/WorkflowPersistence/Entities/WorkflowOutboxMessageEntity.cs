@@ -19,6 +19,8 @@ public sealed class WorkflowOutboxMessageEntity
 
     public string PayloadJson { get; set; } = "{}";
 
+    public string HeadersJson { get; set; } = "{}";
+
     public WorkflowOutboxMessageStatus Status { get; set; }
 
     public int RetryCount { get; set; }

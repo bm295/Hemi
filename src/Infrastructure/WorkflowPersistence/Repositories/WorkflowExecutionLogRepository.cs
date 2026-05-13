@@ -1,11 +1,237 @@
 using System.Data;
+using Hemi.Application.Workflows.Abstractions;
 using Hemi.Infrastructure.WorkflowPersistence.Entities;
 using Microsoft.Data.SqlClient;
 
 namespace Hemi.Infrastructure.WorkflowPersistence.Repositories;
 
 public sealed class WorkflowExecutionLogRepository(string connectionString)
+    : IWorkflowExecutionLogStore, IWorkflowOutboxStore
 {
+    private const string StepColumns = """
+        Id, WorkflowInstanceId, StepName, StepOrder, Status, Attempt,
+        CommandId, ErrorMessage, StartedAtUtc, CompletedAtUtc, CompensatedAtUtc
+        """;
+
+    private const string OutboxColumns = """
+        Id, WorkflowInstanceId, MessageType, Destination, PayloadJson,
+        HeadersJson, Status, RetryCount, ErrorMessage, CreatedAtUtc,
+        LastAttemptAtUtc, NextAttemptAtUtc, PublishedAtUtc
+        """;
+
+    public async Task<IReadOnlyCollection<WorkflowStepAttemptRecord>> GetStepAttemptsAsync(
+        Guid workflowInstanceId,
+        CancellationToken cancellationToken = default)
+    {
+        var stepExecutions = await GetStepExecutionsAsync(
+            workflowInstanceId,
+            cancellationToken);
+
+        return stepExecutions
+            .Select(MapAttemptRecord)
+            .ToArray();
+    }
+
+    public async Task<WorkflowStepAttemptRecord> MarkStepRunningAsync(
+        WorkflowStepAttemptStart request,
+        CancellationToken cancellationToken = default)
+    {
+        Validate(request);
+
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        const string sql = """
+            MERGE dbo.WorkflowStepExecution AS Target
+            USING (
+                SELECT @WorkflowInstanceId AS WorkflowInstanceId,
+                       @StepOrder AS StepOrder,
+                       @Attempt AS Attempt
+            ) AS Source
+            ON Target.WorkflowInstanceId = Source.WorkflowInstanceId
+               AND Target.StepOrder = Source.StepOrder
+               AND Target.Attempt = Source.Attempt
+            WHEN MATCHED THEN
+                UPDATE SET
+                    StepName = @StepName,
+                    Status = @Status,
+                    CommandId = @CommandId,
+                    ErrorMessage = NULL,
+                    StartedAtUtc = @StartedAtUtc,
+                    CompletedAtUtc = NULL,
+                    CompensatedAtUtc = NULL
+            WHEN NOT MATCHED THEN
+                INSERT (Id, WorkflowInstanceId, StepName, StepOrder, Status,
+                        Attempt, CommandId, ErrorMessage, StartedAtUtc,
+                        CompletedAtUtc, CompensatedAtUtc)
+                VALUES (@Id, @WorkflowInstanceId, @StepName, @StepOrder,
+                        @Status, @Attempt, @CommandId, NULL, @StartedAtUtc,
+                        NULL, NULL)
+            OUTPUT inserted.Id, inserted.WorkflowInstanceId, inserted.StepName,
+                   inserted.StepOrder, inserted.Status, inserted.Attempt,
+                   inserted.CommandId, inserted.ErrorMessage,
+                   inserted.StartedAtUtc, inserted.CompletedAtUtc,
+                   inserted.CompensatedAtUtc;
+            """;
+
+        await using var command = new SqlCommand(sql, connection);
+        _ = command.Parameters.Add("@Id", SqlDbType.UniqueIdentifier).Value = Guid.NewGuid();
+        _ = command.Parameters.Add("@WorkflowInstanceId", SqlDbType.UniqueIdentifier).Value =
+            request.WorkflowInstanceId;
+        _ = command.Parameters.Add("@StepName", SqlDbType.NVarChar, 128).Value = request.StepName;
+        _ = command.Parameters.Add("@StepOrder", SqlDbType.Int).Value = request.StepOrder;
+        _ = command.Parameters.Add("@Status", SqlDbType.NVarChar, 32).Value =
+            WorkflowStepExecutionStatus.Running.ToString();
+        _ = command.Parameters.Add("@Attempt", SqlDbType.Int).Value = request.Attempt;
+        AddNullable(command, "@CommandId", SqlDbType.UniqueIdentifier, request.CommandId);
+        _ = command.Parameters.Add("@StartedAtUtc", SqlDbType.DateTimeOffset).Value =
+            request.StartedAtUtc ?? DateTimeOffset.UtcNow;
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            throw new InvalidOperationException(
+                "Step attempt update did not return a row.");
+        }
+
+        return MapAttemptRecord(reader);
+    }
+
+    public async Task<bool> MarkStepSucceededAsync(
+        Guid workflowInstanceId,
+        int stepOrder,
+        int attempt,
+        DateTimeOffset completedAtUtc,
+        CancellationToken cancellationToken = default)
+    {
+        return await MarkStepTerminalAsync(
+            workflowInstanceId,
+            stepOrder,
+            attempt,
+            WorkflowStepExecutionStatus.Succeeded,
+            errorMessage: null,
+            completedAtUtc,
+            compensatedAtUtc: null,
+            cancellationToken);
+    }
+
+    public async Task<bool> MarkStepFailedAsync(
+        Guid workflowInstanceId,
+        int stepOrder,
+        int attempt,
+        string errorMessage,
+        DateTimeOffset completedAtUtc,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(errorMessage))
+        {
+            throw new ArgumentException(
+                "Error message is required.",
+                nameof(errorMessage));
+        }
+
+        return await MarkStepTerminalAsync(
+            workflowInstanceId,
+            stepOrder,
+            attempt,
+            WorkflowStepExecutionStatus.Failed,
+            errorMessage,
+            completedAtUtc,
+            compensatedAtUtc: null,
+            cancellationToken);
+    }
+
+    public async Task<bool> MarkStepCompensatedAsync(
+        Guid workflowInstanceId,
+        int stepOrder,
+        int attempt,
+        DateTimeOffset compensatedAtUtc,
+        CancellationToken cancellationToken = default)
+    {
+        return await MarkStepTerminalAsync(
+            workflowInstanceId,
+            stepOrder,
+            attempt,
+            WorkflowStepExecutionStatus.Compensated,
+            errorMessage: null,
+            completedAtUtc: null,
+            compensatedAtUtc,
+            cancellationToken);
+    }
+
+    public async Task<WorkflowOutboxMessageRecord> SaveMessageAsync(
+        WorkflowOutboxMessageDraft message,
+        CancellationToken cancellationToken = default)
+    {
+        Validate(message);
+
+        var entity = new WorkflowOutboxMessageEntity
+        {
+            Id = Guid.NewGuid(),
+            WorkflowInstanceId = message.WorkflowInstanceId,
+            MessageType = message.MessageType,
+            Destination = message.Destination,
+            PayloadJson = message.PayloadJson,
+            HeadersJson = string.IsNullOrWhiteSpace(message.HeadersJson)
+                ? "{}"
+                : message.HeadersJson,
+            Status = WorkflowOutboxMessageStatus.Pending,
+            RetryCount = 0,
+            CreatedAtUtc = message.CreatedAtUtc ?? DateTimeOffset.UtcNow,
+            NextAttemptAtUtc = message.NextAttemptAtUtc
+        };
+
+        await SaveOutboxMessageAsync(entity, cancellationToken);
+        return MapOutboxRecord(entity);
+    }
+
+    public async Task<IReadOnlyCollection<WorkflowOutboxMessageRecord>> GetMessagesForWorkflowAsync(
+        Guid workflowInstanceId,
+        CancellationToken cancellationToken = default)
+    {
+        var messages = await GetOutboxMessagesAsync(
+            workflowInstanceId,
+            cancellationToken);
+
+        return messages
+            .Select(MapOutboxRecord)
+            .ToArray();
+    }
+
+    public async Task<IReadOnlyCollection<WorkflowOutboxMessageRecord>> GetPendingMessagesAsync(
+        int batchSize = 50,
+        DateTimeOffset? dueAtUtc = null,
+        CancellationToken cancellationToken = default)
+    {
+        var messages = await GetPendingOutboxMessagesAsync(
+            batchSize,
+            dueAtUtc,
+            cancellationToken);
+
+        return messages
+            .Select(MapOutboxRecord)
+            .ToArray();
+    }
+
+    public Task MarkMessagePublishedAsync(
+        Guid messageId,
+        DateTimeOffset publishedAtUtc,
+        CancellationToken cancellationToken = default) =>
+        MarkOutboxMessagePublishedAsync(messageId, publishedAtUtc, cancellationToken);
+
+    public Task MarkMessageFailedAsync(
+        Guid messageId,
+        string errorMessage,
+        DateTimeOffset lastAttemptAtUtc,
+        DateTimeOffset? nextAttemptAtUtc,
+        CancellationToken cancellationToken = default) =>
+        MarkOutboxMessageFailedAsync(
+            messageId,
+            errorMessage,
+            lastAttemptAtUtc,
+            nextAttemptAtUtc,
+            cancellationToken);
+
     public async Task<IReadOnlyCollection<WorkflowStepExecutionEntity>> GetStepExecutionsAsync(
         Guid workflowInstanceId,
         CancellationToken cancellationToken = default)
@@ -13,9 +239,8 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
 
-        const string sql = """
-            SELECT Id, WorkflowInstanceId, StepName, StepOrder, Status, Attempt,
-                   CommandId, ErrorMessage, StartedAtUtc, CompletedAtUtc, CompensatedAtUtc
+        var sql = $"""
+            SELECT {StepColumns}
             FROM dbo.WorkflowStepExecution
             WHERE WorkflowInstanceId = @WorkflowInstanceId
             ORDER BY StepOrder, Attempt;
@@ -90,10 +315,8 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
 
-        const string sql = """
-            SELECT Id, WorkflowInstanceId, MessageType, Destination, PayloadJson, Status,
-                   RetryCount, ErrorMessage, CreatedAtUtc, LastAttemptAtUtc,
-                   NextAttemptAtUtc, PublishedAtUtc
+        var sql = $"""
+            SELECT {OutboxColumns}
             FROM dbo.WorkflowOutboxMessage
             WHERE WorkflowInstanceId = @WorkflowInstanceId
             ORDER BY CreatedAtUtc;
@@ -128,11 +351,8 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
 
-        const string sql = """
-            SELECT TOP (@BatchSize)
-                   Id, WorkflowInstanceId, MessageType, Destination, PayloadJson, Status,
-                   RetryCount, ErrorMessage, CreatedAtUtc, LastAttemptAtUtc,
-                   NextAttemptAtUtc, PublishedAtUtc
+        var sql = $"""
+            SELECT TOP (@BatchSize) {OutboxColumns}
             FROM dbo.WorkflowOutboxMessage
             WHERE Status = @Status
               AND (NextAttemptAtUtc IS NULL OR NextAttemptAtUtc <= @DueAtUtc)
@@ -173,6 +393,11 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
             entity.CreatedAtUtc = DateTimeOffset.UtcNow;
         }
 
+        if (string.IsNullOrWhiteSpace(entity.HeadersJson))
+        {
+            entity.HeadersJson = "{}";
+        }
+
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
 
@@ -186,6 +411,7 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
                     MessageType = @MessageType,
                     Destination = @Destination,
                     PayloadJson = @PayloadJson,
+                    HeadersJson = @HeadersJson,
                     Status = @Status,
                     RetryCount = @RetryCount,
                     ErrorMessage = @ErrorMessage,
@@ -193,11 +419,13 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
                     NextAttemptAtUtc = @NextAttemptAtUtc,
                     PublishedAtUtc = @PublishedAtUtc
             WHEN NOT MATCHED THEN
-                INSERT (Id, WorkflowInstanceId, MessageType, Destination, PayloadJson, Status,
-                        RetryCount, ErrorMessage, CreatedAtUtc, LastAttemptAtUtc,
+                INSERT (Id, WorkflowInstanceId, MessageType, Destination,
+                        PayloadJson, HeadersJson, Status, RetryCount,
+                        ErrorMessage, CreatedAtUtc, LastAttemptAtUtc,
                         NextAttemptAtUtc, PublishedAtUtc)
-                VALUES (@Id, @WorkflowInstanceId, @MessageType, @Destination, @PayloadJson, @Status,
-                        @RetryCount, @ErrorMessage, @CreatedAtUtc, @LastAttemptAtUtc,
+                VALUES (@Id, @WorkflowInstanceId, @MessageType, @Destination,
+                        @PayloadJson, @HeadersJson, @Status, @RetryCount,
+                        @ErrorMessage, @CreatedAtUtc, @LastAttemptAtUtc,
                         @NextAttemptAtUtc, @PublishedAtUtc);
             """;
 
@@ -241,6 +469,13 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         DateTimeOffset? nextAttemptAtUtc,
         CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrWhiteSpace(errorMessage))
+        {
+            throw new ArgumentException(
+                "Error message is required.",
+                nameof(errorMessage));
+        }
+
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
 
@@ -268,6 +503,95 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         _ = await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
+    private async Task<bool> MarkStepTerminalAsync(
+        Guid workflowInstanceId,
+        int stepOrder,
+        int attempt,
+        WorkflowStepExecutionStatus status,
+        string? errorMessage,
+        DateTimeOffset? completedAtUtc,
+        DateTimeOffset? compensatedAtUtc,
+        CancellationToken cancellationToken)
+    {
+        if (workflowInstanceId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "Workflow instance id is required.",
+                nameof(workflowInstanceId));
+        }
+
+        if (stepOrder <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(stepOrder),
+                "Step order must be greater than zero.");
+        }
+
+        if (attempt <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(attempt),
+                "Attempt must be greater than zero.");
+        }
+
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        const string sql = """
+            UPDATE dbo.WorkflowStepExecution
+            SET Status = @Status,
+                ErrorMessage = @ErrorMessage,
+                CompletedAtUtc = COALESCE(@CompletedAtUtc, CompletedAtUtc),
+                CompensatedAtUtc = COALESCE(@CompensatedAtUtc, CompensatedAtUtc)
+            WHERE WorkflowInstanceId = @WorkflowInstanceId
+              AND StepOrder = @StepOrder
+              AND Attempt = @Attempt;
+            """;
+
+        await using var command = new SqlCommand(sql, connection);
+        _ = command.Parameters.Add("@WorkflowInstanceId", SqlDbType.UniqueIdentifier).Value =
+            workflowInstanceId;
+        _ = command.Parameters.Add("@StepOrder", SqlDbType.Int).Value = stepOrder;
+        _ = command.Parameters.Add("@Attempt", SqlDbType.Int).Value = attempt;
+        _ = command.Parameters.Add("@Status", SqlDbType.NVarChar, 32).Value = status.ToString();
+        AddNullable(command, "@ErrorMessage", SqlDbType.NVarChar, 1024, errorMessage);
+        AddNullable(command, "@CompletedAtUtc", SqlDbType.DateTimeOffset, completedAtUtc);
+        AddNullable(command, "@CompensatedAtUtc", SqlDbType.DateTimeOffset, compensatedAtUtc);
+
+        return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+    }
+
+    private static void Validate(WorkflowStepAttemptStart request)
+    {
+        if (request.WorkflowInstanceId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "Workflow instance id is required.",
+                nameof(request));
+        }
+
+        if (string.IsNullOrWhiteSpace(request.StepName))
+        {
+            throw new ArgumentException(
+                "Step name is required.",
+                nameof(request));
+        }
+
+        if (request.StepOrder <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(request),
+                "Step order must be greater than zero.");
+        }
+
+        if (request.Attempt <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(request),
+                "Attempt must be greater than zero.");
+        }
+    }
+
     private static void Validate(WorkflowStepExecutionEntity entity)
     {
         if (entity.WorkflowInstanceId == Guid.Empty)
@@ -289,6 +613,37 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
             throw new ArgumentOutOfRangeException(
                 nameof(entity),
                 "Step order must be greater than zero.");
+        }
+    }
+
+    private static void Validate(WorkflowOutboxMessageDraft message)
+    {
+        if (message.WorkflowInstanceId == Guid.Empty)
+        {
+            throw new ArgumentException(
+                "Workflow instance id is required.",
+                nameof(message));
+        }
+
+        if (string.IsNullOrWhiteSpace(message.MessageType))
+        {
+            throw new ArgumentException(
+                "Message type is required.",
+                nameof(message));
+        }
+
+        if (string.IsNullOrWhiteSpace(message.Destination))
+        {
+            throw new ArgumentException(
+                "Destination is required.",
+                nameof(message));
+        }
+
+        if (string.IsNullOrWhiteSpace(message.PayloadJson))
+        {
+            throw new ArgumentException(
+                "Payload JSON is required.",
+                nameof(message));
         }
     }
 
@@ -344,6 +699,7 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         _ = command.Parameters.Add("@MessageType", SqlDbType.NVarChar, 128).Value = entity.MessageType;
         _ = command.Parameters.Add("@Destination", SqlDbType.NVarChar, 256).Value = entity.Destination;
         _ = command.Parameters.Add("@PayloadJson", SqlDbType.NVarChar, -1).Value = entity.PayloadJson;
+        _ = command.Parameters.Add("@HeadersJson", SqlDbType.NVarChar, -1).Value = entity.HeadersJson;
         _ = command.Parameters.Add("@Status", SqlDbType.NVarChar, 32).Value = entity.Status.ToString();
         _ = command.Parameters.Add("@RetryCount", SqlDbType.Int).Value = entity.RetryCount;
         AddNullable(command, "@ErrorMessage", SqlDbType.NVarChar, 1024, entity.ErrorMessage);
@@ -369,6 +725,24 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
             CompensatedAtUtc = reader.IsDBNull(10) ? null : reader.GetDateTimeOffset(10)
         };
 
+    private static WorkflowStepAttemptRecord MapAttemptRecord(SqlDataReader reader) =>
+        MapAttemptRecord(MapStepExecution(reader));
+
+    private static WorkflowStepAttemptRecord MapAttemptRecord(
+        WorkflowStepExecutionEntity entity) =>
+        new(
+            entity.Id,
+            entity.WorkflowInstanceId,
+            entity.StepName,
+            entity.StepOrder,
+            MapAttemptStatus(entity.Status),
+            entity.Attempt,
+            entity.CommandId,
+            entity.ErrorMessage,
+            entity.StartedAtUtc,
+            entity.CompletedAtUtc,
+            entity.CompensatedAtUtc);
+
     private static WorkflowOutboxMessageEntity MapOutboxMessage(SqlDataReader reader) =>
         new()
         {
@@ -377,13 +751,53 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
             MessageType = reader.GetString(2),
             Destination = reader.GetString(3),
             PayloadJson = reader.GetString(4),
-            Status = ParseOutboxStatus(reader.GetString(5)),
-            RetryCount = reader.GetInt32(6),
-            ErrorMessage = reader.IsDBNull(7) ? null : reader.GetString(7),
-            CreatedAtUtc = reader.GetDateTimeOffset(8),
-            LastAttemptAtUtc = reader.IsDBNull(9) ? null : reader.GetDateTimeOffset(9),
-            NextAttemptAtUtc = reader.IsDBNull(10) ? null : reader.GetDateTimeOffset(10),
-            PublishedAtUtc = reader.IsDBNull(11) ? null : reader.GetDateTimeOffset(11)
+            HeadersJson = reader.GetString(5),
+            Status = ParseOutboxStatus(reader.GetString(6)),
+            RetryCount = reader.GetInt32(7),
+            ErrorMessage = reader.IsDBNull(8) ? null : reader.GetString(8),
+            CreatedAtUtc = reader.GetDateTimeOffset(9),
+            LastAttemptAtUtc = reader.IsDBNull(10) ? null : reader.GetDateTimeOffset(10),
+            NextAttemptAtUtc = reader.IsDBNull(11) ? null : reader.GetDateTimeOffset(11),
+            PublishedAtUtc = reader.IsDBNull(12) ? null : reader.GetDateTimeOffset(12)
+        };
+
+    private static WorkflowOutboxMessageRecord MapOutboxRecord(
+        WorkflowOutboxMessageEntity entity) =>
+        new(
+            entity.Id,
+            entity.WorkflowInstanceId,
+            entity.MessageType,
+            entity.Destination,
+            entity.PayloadJson,
+            entity.HeadersJson,
+            MapOutboxStatus(entity.Status),
+            entity.RetryCount,
+            entity.ErrorMessage,
+            entity.CreatedAtUtc,
+            entity.LastAttemptAtUtc,
+            entity.NextAttemptAtUtc,
+            entity.PublishedAtUtc);
+
+    private static WorkflowStepAttemptStatus MapAttemptStatus(
+        WorkflowStepExecutionStatus status) =>
+        status switch
+        {
+            WorkflowStepExecutionStatus.Running => WorkflowStepAttemptStatus.Running,
+            WorkflowStepExecutionStatus.Succeeded => WorkflowStepAttemptStatus.Succeeded,
+            WorkflowStepExecutionStatus.Failed => WorkflowStepAttemptStatus.Failed,
+            WorkflowStepExecutionStatus.Compensated => WorkflowStepAttemptStatus.Compensated,
+            WorkflowStepExecutionStatus.CompensationFailed =>
+                WorkflowStepAttemptStatus.CompensationFailed,
+            _ => WorkflowStepAttemptStatus.Pending
+        };
+
+    private static WorkflowOutboxStatus MapOutboxStatus(
+        WorkflowOutboxMessageStatus status) =>
+        status switch
+        {
+            WorkflowOutboxMessageStatus.Published => WorkflowOutboxStatus.Published,
+            WorkflowOutboxMessageStatus.Failed => WorkflowOutboxStatus.Failed,
+            _ => WorkflowOutboxStatus.Pending
         };
 
     private static WorkflowStepExecutionStatus ParseStepExecutionStatus(string raw) =>

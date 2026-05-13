@@ -1,5 +1,6 @@
 using System.Data;
 using System.Text;
+using Hemi.Application.Workflows.Abstractions;
 using Hemi.Domain.Workflows;
 using Hemi.Infrastructure.WorkflowPersistence.Entities;
 using Hemi.Infrastructure.WorkflowPersistence.Repositories;
@@ -9,6 +10,204 @@ namespace Hemi.Tests.Infrastructure.WorkflowPersistence;
 
 public sealed class SqlServerWorkflowPersistenceTests
 {
+    [SqlServerFact]
+    public async Task WorkflowInstanceStore_starts_idempotently_claims_and_updates_instances()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        IWorkflowInstanceStore store = new WorkflowInstanceRepository(database.ConnectionString);
+        WorkflowInstanceRecord? instance = null;
+        var requestedAtUtc = DateTimeOffset.UtcNow.AddSeconds(-5);
+        var requestHash = new string('a', 64);
+        var request = new WorkflowStartRequest(
+            WorkflowIds.OrderFulfillment,
+            "Order Fulfillment",
+            Guid.NewGuid().ToString("D"),
+            """{"source":"store-test"}""",
+            $"workflow-store-test-{Guid.NewGuid():N}",
+            requestHash,
+            "sql-tests",
+            requestedAtUtc);
+
+        try
+        {
+            var started = await store.StartWorkflowAsync(request);
+
+            Assert.Equal(WorkflowStartStatus.Created, started.Status);
+            Assert.NotNull(started.Instance);
+            instance = started.Instance;
+            Assert.Equal(WorkflowState.Pending, instance.State);
+            Assert.Equal(0, instance.Attempt);
+            Assert.Equal(request.IdempotencyKey, instance.IdempotencyKey);
+            Assert.Equal(requestHash, instance.RequestHash);
+
+            var repeated = await store.StartWorkflowAsync(request);
+
+            Assert.Equal(WorkflowStartStatus.Existing, repeated.Status);
+            Assert.NotNull(repeated.Instance);
+            Assert.Equal(instance.CommandId, repeated.Instance.CommandId);
+
+            var conflict = await store.StartWorkflowAsync(
+                request with { RequestHash = new string('b', 64) });
+
+            Assert.Equal(WorkflowStartStatus.IdempotencyConflict, conflict.Status);
+            Assert.Equal(requestHash, conflict.ExistingRequestHash);
+
+            var claimed = await store.ClaimDueInstancesAsync(
+                DateTimeOffset.UtcNow,
+                "sql-test-worker",
+                TimeSpan.FromMinutes(5),
+                batchSize: 1);
+
+            var claimedInstance = Assert.Single(claimed);
+            Assert.Equal(instance.Id, claimedInstance.Id);
+            Assert.Equal(WorkflowState.Running, claimedInstance.State);
+            Assert.Equal(1, claimedInstance.Attempt);
+            Assert.Equal("sql-test-worker", claimedInstance.LeaseOwner);
+            Assert.NotNull(claimedInstance.LeaseUntilUtc);
+
+            var payloadUpdated = await store.TryUpdatePayloadAsync(
+                claimedInstance.Id,
+                claimedInstance.Version,
+                """{"source":"store-test","progress":1}""");
+
+            Assert.True(payloadUpdated);
+
+            var withPayload = await store.GetInstanceByIdAsync(claimedInstance.Id);
+
+            Assert.NotNull(withPayload);
+            Assert.Contains(
+                @"""progress"":1",
+                withPayload.PayloadJson,
+                StringComparison.Ordinal);
+
+            var released = await store.TryReleaseLeaseAsync(
+                withPayload.Id,
+                "sql-test-worker",
+                withPayload.Version);
+
+            Assert.True(released);
+
+            var afterRelease = await store.GetInstanceByIdAsync(claimedInstance.Id);
+
+            Assert.NotNull(afterRelease);
+            Assert.Null(afterRelease.LeaseOwner);
+            Assert.Null(afterRelease.LeaseUntilUtc);
+        }
+        finally
+        {
+            if (instance is not null)
+            {
+                await database.DeleteWorkflowInstanceAsync(instance.Id);
+            }
+        }
+    }
+
+    [SqlServerFact]
+    public async Task WorkflowExecutionLogStore_tracks_attempt_lifecycle_and_outbox_messages()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var instanceRepository = new WorkflowInstanceRepository(database.ConnectionString);
+        IWorkflowExecutionLogStore logStore = new WorkflowExecutionLogRepository(database.ConnectionString);
+        IWorkflowOutboxStore outboxStore = new WorkflowExecutionLogRepository(database.ConnectionString);
+        var instance = new WorkflowInstanceEntity
+        {
+            Id = Guid.NewGuid(),
+            WorkflowId = WorkflowIds.OrderFulfillment,
+            WorkflowName = "Order Fulfillment",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = WorkflowState.Running,
+            PayloadJson = """{"source":"store-test"}"""
+        };
+
+        try
+        {
+            await instanceRepository.SaveAsync(instance);
+
+            var running = await logStore.MarkStepRunningAsync(
+                new WorkflowStepAttemptStart(
+                    instance.Id,
+                    "CaptureOrderPaymentStep",
+                    StepOrder: 2,
+                    Attempt: 1,
+                    CommandId: Guid.NewGuid(),
+                    StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-1)));
+
+            Assert.Equal(WorkflowStepAttemptStatus.Running, running.Status);
+
+            var succeeded = await logStore.MarkStepSucceededAsync(
+                instance.Id,
+                stepOrder: 2,
+                attempt: 1,
+                DateTimeOffset.UtcNow);
+
+            Assert.True(succeeded);
+
+            var attempts = await logStore.GetStepAttemptsAsync(instance.Id);
+            var attempt = Assert.Single(attempts);
+            Assert.Equal(WorkflowStepAttemptStatus.Succeeded, attempt.Status);
+            Assert.NotNull(attempt.CompletedAtUtc);
+
+            var compensated = await logStore.MarkStepCompensatedAsync(
+                instance.Id,
+                stepOrder: 2,
+                attempt: 1,
+                DateTimeOffset.UtcNow);
+
+            Assert.True(compensated);
+
+            var compensatedAttempts = await logStore.GetStepAttemptsAsync(instance.Id);
+            var compensatedAttempt = Assert.Single(compensatedAttempts);
+            Assert.Equal(WorkflowStepAttemptStatus.Compensated, compensatedAttempt.Status);
+            Assert.NotNull(compensatedAttempt.CompletedAtUtc);
+            Assert.NotNull(compensatedAttempt.CompensatedAtUtc);
+
+            var message = await outboxStore.SaveMessageAsync(
+                new WorkflowOutboxMessageDraft(
+                    instance.Id,
+                    "workflow.step.succeeded",
+                    "workflow-events",
+                    """{"step":"CaptureOrderPaymentStep"}""",
+                    """{"traceId":"sql-tests"}""",
+                    CreatedAtUtc: DateTimeOffset.UtcNow.AddMinutes(-1),
+                    NextAttemptAtUtc: DateTimeOffset.UtcNow.AddSeconds(-1)));
+
+            Assert.Equal(WorkflowOutboxStatus.Pending, message.Status);
+            Assert.Equal("""{"traceId":"sql-tests"}""", message.HeadersJson);
+
+            var pending = await outboxStore.GetPendingMessagesAsync(
+                dueAtUtc: DateTimeOffset.UtcNow);
+
+            Assert.Contains(pending, pendingMessage => pendingMessage.Id == message.Id);
+
+            await outboxStore.MarkMessageFailedAsync(
+                message.Id,
+                "transient failure",
+                DateTimeOffset.UtcNow,
+                DateTimeOffset.UtcNow.AddMinutes(5));
+
+            var afterFailure = Assert.Single(
+                await outboxStore.GetMessagesForWorkflowAsync(instance.Id));
+
+            Assert.Equal(WorkflowOutboxStatus.Pending, afterFailure.Status);
+            Assert.Equal(1, afterFailure.RetryCount);
+
+            await outboxStore.MarkMessagePublishedAsync(
+                message.Id,
+                DateTimeOffset.UtcNow);
+
+            var afterPublish = Assert.Single(
+                await outboxStore.GetMessagesForWorkflowAsync(instance.Id));
+
+            Assert.Equal(WorkflowOutboxStatus.Published, afterPublish.Status);
+            Assert.NotNull(afterPublish.PublishedAtUtc);
+            Assert.Null(afterPublish.ErrorMessage);
+        }
+        finally
+        {
+            await database.DeleteWorkflowInstanceAsync(instance.Id);
+        }
+    }
+
     [SqlServerFact]
     public async Task WorkflowInstanceRepository_saves_reads_and_updates_instance_state()
     {

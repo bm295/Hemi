@@ -2,6 +2,7 @@
 using System.Threading.Tasks;
 
 namespace Hemi.Application.Workflows.Abstractions;
+
 public interface IWorkflowOrchestrator<TRequest, TResult>
 {
     string WorkflowKey { get; }
