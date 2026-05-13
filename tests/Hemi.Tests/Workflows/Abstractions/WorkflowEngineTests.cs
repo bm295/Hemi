@@ -98,6 +98,125 @@ public sealed class WorkflowEngineTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_records_failed_step_lifecycle_and_persists_workflow_failure()
+    {
+        var services = new ServiceCollection();
+        var instanceStore = new RecordingWorkflowInstanceStore();
+        var logStore = new RecordingWorkflowExecutionLogStore();
+        services.AddSingleton<IWorkflowInstanceStore>(instanceStore);
+        services.AddSingleton<IWorkflowExecutionLogStore>(logStore);
+        services.AddTransient<FailingStep>();
+
+        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var context = new WorkflowContext("test-workflow", "correlation-failed-step")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 5,
+            WorkflowAttempt = 3,
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FailingStep));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => engine.ExecuteAsync("test-workflow", definition, context));
+
+        Assert.Equal("Step failed.", exception.Message);
+        Assert.Equal(WorkflowState.Compensated, context.State);
+        Assert.Equal(["running:1:3", "failed:1:3"], logStore.Transitions);
+        Assert.Contains(WorkflowState.Failed, instanceStore.States);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_resumes_by_skipping_persisted_succeeded_steps()
+    {
+        var services = new ServiceCollection();
+        var recorder = new StepRecorder();
+        var logStore = new RecordingWorkflowExecutionLogStore(
+        [
+            new WorkflowStepAttemptRecord(
+                Guid.NewGuid(),
+                WorkflowInstanceId: Guid.Parse("22222222-2222-2222-2222-222222222222"),
+                StepName: nameof(FirstStep),
+                StepOrder: 1,
+                WorkflowStepAttemptStatus.Succeeded,
+                Attempt: 1,
+                CommandId: Guid.NewGuid(),
+                ErrorMessage: null,
+                StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-5),
+                CompletedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-4),
+                CompensatedAtUtc: null)
+        ]);
+        services.AddSingleton(recorder);
+        services.AddSingleton<IWorkflowExecutionLogStore>(logStore);
+        services.AddTransient<FirstStep>();
+        services.AddTransient<SecondStep>();
+
+        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var context = new WorkflowContext("test-workflow", "correlation-resume")
+        {
+            WorkflowInstanceId = Guid.Parse("22222222-2222-2222-2222-222222222222"),
+            WorkflowInstanceVersion = 2,
+            WorkflowAttempt = 2,
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FirstStep),
+            typeof(SecondStep));
+
+        await engine.ExecuteAsync("test-workflow", definition, context);
+
+        Assert.Equal(["second"], recorder.Executed);
+        Assert.Equal(["running:2:2", "succeeded:2:2"], logStore.Transitions);
+        Assert.Equal(WorkflowState.Succeeded, context.State);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_persists_compensation_state_and_step_logs()
+    {
+        var services = new ServiceCollection();
+        var recorder = new StepRecorder();
+        var instanceStore = new RecordingWorkflowInstanceStore();
+        var logStore = new RecordingWorkflowExecutionLogStore();
+        services.AddSingleton(recorder);
+        services.AddSingleton<IWorkflowInstanceStore>(instanceStore);
+        services.AddSingleton<IWorkflowExecutionLogStore>(logStore);
+        services.AddTransient<CompensableStep>();
+        services.AddTransient<FailingStep>();
+
+        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var context = new WorkflowContext("test-workflow", "correlation-compensation")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 1,
+            WorkflowAttempt = 1,
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(CompensableStep),
+            typeof(FailingStep));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => engine.ExecuteAsync("test-workflow", definition, context));
+
+        Assert.Equal("Step failed.", exception.Message);
+        Assert.Equal(WorkflowState.Compensated, context.State);
+        Assert.Equal(["compensable", "compensated"], recorder.Executed);
+        Assert.Contains("running:1:1", logStore.Transitions);
+        Assert.Contains("succeeded:1:1", logStore.Transitions);
+        Assert.Contains("running:2:1", logStore.Transitions);
+        Assert.Contains("failed:2:1", logStore.Transitions);
+        Assert.Contains("compensated:1:1", logStore.Transitions);
+        Assert.Contains(WorkflowState.Failed, instanceStore.States);
+        Assert.Contains(WorkflowState.Compensating, instanceStore.States);
+        Assert.Contains(WorkflowState.Compensated, instanceStore.States);
+        Assert.True(instanceStore.Payloads.Count >= 2);
+    }
+
+    [Fact]
     public async Task ExecuteAsync_skips_persisted_succeeded_steps_and_compensates_them_on_failure()
     {
         var services = new ServiceCollection();
