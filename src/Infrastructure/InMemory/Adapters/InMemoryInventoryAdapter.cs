@@ -13,6 +13,15 @@ public sealed class InMemoryInventoryAdapter(InMemoryFnbStore store) : IInventor
         var order = store.Orders.SingleOrDefault(x => x.Id == orderId)
             ?? throw new InvalidOperationException("Order not found.");
 
+        var existingMovements = store.StockMovements
+            .Where(x => x.OrderId == orderId && x.QuantityChanged < 0)
+            .ToArray();
+
+        if (existingMovements.Length > 0)
+        {
+            return Task.FromResult<IReadOnlyCollection<StockMovement>>(existingMovements);
+        }
+
         foreach (var lineGroup in order.Lines.GroupBy(line => line.MenuItemId))
         {
             var inventoryItem = store.Inventory.SingleOrDefault(x => x.MenuItemId == lineGroup.Key)
@@ -57,6 +66,15 @@ public sealed class InMemoryInventoryAdapter(InMemoryFnbStore store) : IInventor
 
     public Task<IReadOnlyCollection<StockMovement>> RestoreInventoryForOrderAsync(Guid orderId, CancellationToken cancellationToken = default)
     {
+        var existingRestorations = store.StockMovements
+            .Where(x => x.OrderId == orderId && x.QuantityChanged > 0)
+            .ToArray();
+
+        if (existingRestorations.Length > 0)
+        {
+            return Task.FromResult<IReadOnlyCollection<StockMovement>>(existingRestorations);
+        }
+
         var deductedMovements = store.StockMovements
             .Where(x => x.OrderId == orderId && x.QuantityChanged < 0)
             .ToArray();

@@ -13,6 +13,14 @@ public sealed class InMemoryPaymentAdapter(InMemoryFnbStore store) : IPaymentQue
         _ = store.Orders.SingleOrDefault(x => x.Id == orderId)
             ?? throw new InvalidOperationException("Order not found.");
 
+        var existingSettledPayment = store.Payments.FirstOrDefault(
+            x => x.OrderId == orderId && x.Status is PaymentStatus.Settled);
+
+        if (existingSettledPayment is not null)
+        {
+            return Task.FromResult(existingSettledPayment);
+        }
+
         var payment = new Payment(
             Guid.NewGuid(),
             orderId,

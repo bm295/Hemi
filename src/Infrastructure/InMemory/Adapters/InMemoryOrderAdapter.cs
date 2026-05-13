@@ -39,6 +39,11 @@ public sealed class InMemoryOrderAdapter(InMemoryFnbStore store) : IOrderQueryPo
         var order = store.Orders.SingleOrDefault(x => x.Id == orderId)
             ?? throw new InvalidOperationException("Order not found.");
 
+        if (order.Status == status)
+        {
+            return Task.FromResult(order);
+        }
+
         var updatedOrder = order with { Status = status };
         store.Orders[store.Orders.IndexOf(order)] = updatedOrder;
 
