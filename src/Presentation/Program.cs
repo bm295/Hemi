@@ -272,6 +272,14 @@ app.MapPost("/orders/{orderId:guid}/fulfillment-saga", async (
             WorkflowId: workflowCommand.WorkflowId,
             CorrelationId: workflowCommand.CorrelationId));
     }
+    catch (WorkflowStartConflictException ex)
+    {
+        return Results.Conflict(new WorkflowErrorResponse(
+            ex.Message,
+            Code: ex.Code,
+            WorkflowId: workflowCommand.WorkflowId,
+            CorrelationId: workflowCommand.CorrelationId));
+    }
     catch (InvalidOperationException ex)
     {
         return Results.Conflict(new WorkflowErrorResponse(
