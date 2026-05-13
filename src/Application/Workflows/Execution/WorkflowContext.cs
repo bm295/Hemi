@@ -1,10 +1,11 @@
 ﻿using Hemi.Domain.Workflows;
+using System.Collections.Concurrent;
 
 namespace Hemi.Application.Workflows.Execution;
 
 public sealed class WorkflowContext
 {
-    private readonly Dictionary<string, object?> _items = new();
+    private readonly ConcurrentDictionary<string, object?> _items = new();
 
     public WorkflowContext(
         string workflowId,
