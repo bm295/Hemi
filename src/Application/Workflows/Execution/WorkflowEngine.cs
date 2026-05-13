@@ -676,7 +676,10 @@ public sealed class WorkflowEngine : IWorkflowEngine
             context.State,
             stepType?.Name,
             error,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow)
+        {
+            WorkflowInstanceId = context.WorkflowInstanceId
+        };
 
         return _workflowEventPublisher.PublishAsync(
             workflowEvent,

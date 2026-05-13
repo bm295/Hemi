@@ -84,10 +84,12 @@ builder.Services.AddSingleton(new WorkflowPolicyRegistration(
     WorkflowPolicies.Default));
 builder.Services.AddSingleton<IRetryPolicyProvider, RetryPolicyProvider>();
 builder.Services.AddSingleton<IWorkflowMessagePublisher, InMemoryWorkflowMessagePublisher>();
-builder.Services.AddSingleton<IWorkflowEventPublisher, WorkflowEventPublisher>();
+builder.Services.AddSingleton<WorkflowOutboxPublisher>();
+builder.Services.AddSingleton<IWorkflowEventPublisher, OutboxWorkflowEventPublisher>();
 builder.Services.AddSingleton<WorkflowCommandQueue>();
 builder.Services.AddScoped<WorkflowCommandSubscriber>();
 builder.Services.AddHostedService<WorkflowWorkerService>();
+builder.Services.AddHostedService<WorkflowOutboxPublisherService>();
 
 var app = builder.Build();
 

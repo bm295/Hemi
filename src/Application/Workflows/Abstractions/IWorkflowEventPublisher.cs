@@ -10,7 +10,10 @@ public sealed record WorkflowEvent(
     WorkflowState State,
     string? StepName,
     Exception? Error,
-    DateTimeOffset OccurredAtUtc);
+    DateTimeOffset OccurredAtUtc)
+{
+    public Guid? WorkflowInstanceId { get; init; }
+}
 
 public interface IWorkflowEventPublisher
 {
