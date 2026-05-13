@@ -167,7 +167,8 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 ex,
                 CancellationToken.None);
 
-            if (policies.EnableCompensation)
+            if (policies.EnableCompensation &&
+                context.State != WorkflowState.Cancelled)
             {
                 await CompensateAsync(
                     workflowId,
