@@ -74,6 +74,14 @@ public static class WorkflowsEndpoints
                     WorkflowId: request.WorkflowId,
                     CorrelationId: request.CorrelationId));
             }
+            catch (WorkflowStartConflictException ex)
+            {
+                return Results.Conflict(new WorkflowErrorResponse(
+                    ex.Message,
+                    Code: ex.Code,
+                    WorkflowId: request.WorkflowId,
+                    CorrelationId: request.CorrelationId));
+            }
             catch (InvalidOperationException ex)
             {
                 return Results.Conflict(new WorkflowErrorResponse(

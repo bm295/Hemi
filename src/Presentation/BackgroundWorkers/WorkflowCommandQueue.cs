@@ -1,14 +1,15 @@
-using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
+using Hemi.Application.Workflows.Abstractions;
 using Hemi.Application.Workflows.Contracts;
-using Hemi.Domain.Workflows;
 
 namespace Hemi.Presentation.BackgroundWorkers;
 
-public sealed class WorkflowCommandQueue
+public sealed class WorkflowCommandQueue(
+    IWorkflowInstanceStore workflowInstanceStore,
+    IWorkflowRegistry workflowRegistry)
 {
     private static readonly JsonSerializerOptions SerializerOptions =
         new(JsonSerializerDefaults.Web);
@@ -21,12 +22,6 @@ public sealed class WorkflowCommandQueue
                 SingleWriter = false
             });
 
-    private readonly ConcurrentDictionary<string, AcceptedWorkflowCommand> _acceptedByIdempotencyKey =
-        new(StringComparer.Ordinal);
-
-    private readonly ConcurrentDictionary<string, WorkflowAcceptedResponse> _acceptedByCorrelation =
-        new(StringComparer.Ordinal);
-
     public async Task<WorkflowAcceptedResponse> EnqueueAsync(
         StartWorkflowCommand request,
         CancellationToken cancellationToken = default)
@@ -36,76 +31,66 @@ public sealed class WorkflowCommandQueue
             ?? throw new InvalidOperationException(
                 "Idempotency key is required for workflow start requests.");
 
-        var correlationKey = CreateCorrelationKey(
+        if (!workflowRegistry.TryGet(
             request.WorkflowId,
-            request.CorrelationId);
-
-        if (_acceptedByCorrelation.TryGetValue(
-                correlationKey,
-                out var existingCorrelationResponse))
+            out var workflowDefinition) ||
+            workflowDefinition is null)
         {
-            return existingCorrelationResponse;
+            throw new InvalidOperationException(
+                $"Workflow '{request.WorkflowId}' is not registered.");
         }
 
         var requestHash = Hash(request);
-        if (_acceptedByIdempotencyKey.TryGetValue(
+        var requestedAtUtc = request.RequestedAtUtc ?? DateTimeOffset.UtcNow;
+        var startResult = await workflowInstanceStore.StartWorkflowAsync(
+            new WorkflowStartRequest(
+                request.WorkflowId,
+                workflowDefinition.Name,
+                request.CorrelationId,
+                SerializeItems(request.Items),
                 idempotencyKey,
-                out var existing))
-        {
-            if (!string.Equals(
-                    existing.RequestHash,
-                    requestHash,
-                    StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    "Idempotency key was already used with a different workflow request.");
-            }
-
-            return existing.Response;
-        }
-
-        var now = DateTimeOffset.UtcNow;
-        var response = new WorkflowAcceptedResponse(
-            Guid.NewGuid(),
-            request.WorkflowId,
-            request.CorrelationId,
-            WorkflowState.Pending,
-            now,
-            idempotencyKey);
-
-        var accepted = new AcceptedWorkflowCommand(
-            requestHash,
-            response);
-
-        if (!_acceptedByIdempotencyKey.TryAdd(
-                idempotencyKey,
-                accepted))
-        {
-            return await EnqueueAsync(request, cancellationToken);
-        }
-
-        if (!_acceptedByCorrelation.TryAdd(correlationKey, response))
-        {
-            _acceptedByIdempotencyKey.TryRemove(
-                idempotencyKey,
-                out _);
-
-            return _acceptedByCorrelation[correlationKey];
-        }
-
-        var workerCommand = new WorkflowWorkerCommand(
-            response.CommandId,
-            request.WorkflowId,
-            request.CorrelationId,
-            request.Items,
-            Attempt: 1,
-            now,
-            idempotencyKey,
-            Source: request.RequestedBy ?? "api");
-
-        await _commands.Writer.WriteAsync(
-            workerCommand,
+                requestHash,
+                request.RequestedBy,
+                requestedAtUtc,
+                NextAttemptAtUtc: requestedAtUtc),
             cancellationToken);
+
+        if (startResult.Status == WorkflowStartStatus.IdempotencyConflict)
+        {
+            throw new WorkflowStartConflictException(
+                "Idempotency key was already used with a different workflow request.",
+                "workflow.idempotency_conflict");
+        }
+
+        if (startResult.Status == WorkflowStartStatus.CorrelationConflict)
+        {
+            throw new WorkflowStartConflictException(
+                "Workflow correlation was already used with a different workflow request.",
+                "workflow.correlation_conflict");
+        }
+
+        var instance = startResult.Instance
+            ?? throw new InvalidOperationException(
+                "Workflow start did not return an instance.");
+
+        var response = ToAcceptedResponse(instance);
+
+        if (startResult.Status == WorkflowStartStatus.Created)
+        {
+            var workerCommand = new WorkflowWorkerCommand(
+                instance.CommandId,
+                request.WorkflowId,
+                request.CorrelationId,
+                request.Items,
+                Attempt: instance.Attempt + 1,
+                instance.CreatedAtUtc,
+                idempotencyKey,
+                Source: request.RequestedBy ?? "api");
+
+            await _commands.Writer.WriteAsync(
+                workerCommand,
+                cancellationToken);
+        }
 
         return response;
     }
@@ -140,10 +125,15 @@ public sealed class WorkflowCommandQueue
         ArgumentNullException.ThrowIfNull(request.Items);
     }
 
-    private static string CreateCorrelationKey(
-        string workflowId,
-        string correlationId) =>
-        $"{workflowId}:{correlationId}";
+    private static WorkflowAcceptedResponse ToAcceptedResponse(
+        WorkflowInstanceRecord instance) =>
+        new(
+            instance.CommandId,
+            instance.WorkflowId,
+            instance.CorrelationId,
+            instance.State,
+            instance.CreatedAtUtc,
+            instance.IdempotencyKey);
 
     private static string Hash(StartWorkflowCommand request)
     {
@@ -155,7 +145,15 @@ public sealed class WorkflowCommandQueue
         return Convert.ToHexString(bytes);
     }
 
-    private sealed record AcceptedWorkflowCommand(
-        string RequestHash,
-        WorkflowAcceptedResponse Response);
+    private static string SerializeItems(
+        IReadOnlyDictionary<string, object?> items) =>
+        JsonSerializer.Serialize(items, SerializerOptions);
+}
+
+public sealed class WorkflowStartConflictException(
+    string message,
+    string code)
+    : InvalidOperationException(message)
+{
+    public string Code { get; } = code;
 }
