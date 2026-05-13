@@ -2,6 +2,7 @@ using Hemi.Application;
 using Hemi.Application.Workflows.Abstractions;
 using Hemi.Application.Workflows.Execution;
 using Hemi.Domain;
+using Hemi.Domain.Workflows;
 using Hemi.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -37,6 +38,15 @@ builder.Services.AddSingleton<FnbManagementService>();
 
 builder.Services.AddScoped<IWorkflowEngine, WorkflowEngine>();
 builder.Services.AddScoped<IWorkflowDispatcher, WorkflowDispatcher>();
+builder.Services.AddSingleton(new WorkflowPolicyRegistration(
+    WorkflowIds.OrderFulfillment,
+    WorkflowPolicies.Default));
+builder.Services.AddSingleton(new WorkflowPolicyRegistration(
+    WorkflowIds.OrderCancellation,
+    WorkflowPolicies.NoRetry));
+builder.Services.AddSingleton(new WorkflowPolicyRegistration(
+    WorkflowIds.InventoryReconciliation,
+    WorkflowPolicies.Default));
 builder.Services.AddSingleton<IRetryPolicyProvider, RetryPolicyProvider>();
 builder.Services.AddSingleton<IWorkflowEventPublisher, NoOpWorkflowEventPublisher>();
 

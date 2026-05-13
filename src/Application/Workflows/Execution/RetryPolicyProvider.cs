@@ -7,14 +7,24 @@ public sealed class RetryPolicyProvider : IRetryPolicyProvider
 {
     private readonly IReadOnlyDictionary<string, WorkflowPolicies> _policies;
 
-    public RetryPolicyProvider()
+    public RetryPolicyProvider(
+        IEnumerable<WorkflowPolicyRegistration> policyRegistrations)
     {
-        _policies = new Dictionary<string, WorkflowPolicies>
+        ArgumentNullException.ThrowIfNull(policyRegistrations);
+
+        var policies =
+            new Dictionary<string, WorkflowPolicies>(StringComparer.Ordinal);
+
+        foreach (var registration in policyRegistrations)
         {
-            [WorkflowIds.OrderFulfillment] = WorkflowPolicies.Default,
-            [WorkflowIds.OrderCancellation] = WorkflowPolicies.NoRetry,
-            [WorkflowIds.InventoryReconciliation] = WorkflowPolicies.Default
-        };
+            if (!policies.TryAdd(registration.WorkflowId, registration.Policy))
+            {
+                throw new InvalidOperationException(
+                    $"Workflow policy '{registration.WorkflowId}' is already registered.");
+            }
+        }
+
+        _policies = policies;
     }
 
     public WorkflowPolicies GetPolicy(string workflowId)
