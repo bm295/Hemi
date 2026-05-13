@@ -15,6 +15,7 @@ using Hemi.Infrastructure.Monitoring;
 using Hemi.Infrastructure.WorkflowPersistence.Repositories;
 using Hemi.Presentation.BackgroundWorkers;
 using Hemi.Presentation.Endpoints;
+using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -159,7 +160,7 @@ app.MapPost("/orders/{orderId:guid}/items", async (Guid orderId, AddOrderItemReq
     }
 });
 
-app.MapDelete("/orders/{orderId:guid}/items", async (Guid orderId, RemoveOrderItemRequest request, FnbManagementService service, CancellationToken cancellationToken) =>
+app.MapDelete("/orders/{orderId:guid}/items", async (Guid orderId, [FromBody] RemoveOrderItemRequest request, FnbManagementService service, CancellationToken cancellationToken) =>
 {
     try
     {
@@ -375,3 +376,5 @@ public sealed record IntegrateFoodAppOrderApiRequest(
     IReadOnlyCollection<IntegrateFoodAppOrderItemApiRequest> Items);
 
 public sealed record IntegrateFoodAppOrderItemApiRequest(Guid MenuItemId, int Quantity);
+
+public partial class Program;
