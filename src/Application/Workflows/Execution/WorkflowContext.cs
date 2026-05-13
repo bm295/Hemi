@@ -20,6 +20,14 @@ public sealed class WorkflowContext
 
     public string CorrelationId { get; }
 
+    public Guid? WorkflowInstanceId { get; set; }
+
+    public int WorkflowInstanceVersion { get; set; }
+
+    public int WorkflowAttempt { get; set; }
+
+    public Guid? CommandId { get; set; }
+
     public WorkflowState State { get; set; }
 
     public Exception? LastError { get; set; }

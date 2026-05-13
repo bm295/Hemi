@@ -62,4 +62,12 @@ public interface IWorkflowExecutionLogStore
         int attempt,
         DateTimeOffset compensatedAtUtc,
         CancellationToken cancellationToken = default);
+
+    Task<bool> MarkStepCompensationFailedAsync(
+        Guid workflowInstanceId,
+        int stepOrder,
+        int attempt,
+        string errorMessage,
+        DateTimeOffset compensatedAtUtc,
+        CancellationToken cancellationToken = default);
 }

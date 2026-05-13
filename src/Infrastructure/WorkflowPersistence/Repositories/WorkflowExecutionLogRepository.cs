@@ -159,6 +159,32 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
             cancellationToken);
     }
 
+    public async Task<bool> MarkStepCompensationFailedAsync(
+        Guid workflowInstanceId,
+        int stepOrder,
+        int attempt,
+        string errorMessage,
+        DateTimeOffset compensatedAtUtc,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(errorMessage))
+        {
+            throw new ArgumentException(
+                "Error message is required.",
+                nameof(errorMessage));
+        }
+
+        return await MarkStepTerminalAsync(
+            workflowInstanceId,
+            stepOrder,
+            attempt,
+            WorkflowStepExecutionStatus.CompensationFailed,
+            errorMessage,
+            completedAtUtc: null,
+            compensatedAtUtc,
+            cancellationToken);
+    }
+
     public async Task<WorkflowOutboxMessageRecord> SaveMessageAsync(
         WorkflowOutboxMessageDraft message,
         CancellationToken cancellationToken = default)

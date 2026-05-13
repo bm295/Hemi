@@ -227,18 +227,27 @@ public sealed class WorkflowWorkerService(
 
         if (await workflowInstanceStore.TryUpdatePayloadAsync(
                 instance.Id,
-                instance.Version,
+                context.WorkflowInstanceVersion > 0
+                    ? context.WorkflowInstanceVersion
+                    : instance.Version,
                 payloadJson,
                 cancellationToken))
         {
-            return instance.Version + 1;
+            context.WorkflowInstanceVersion =
+                context.WorkflowInstanceVersion > 0
+                    ? context.WorkflowInstanceVersion + 1
+                    : instance.Version + 1;
+
+            return context.WorkflowInstanceVersion;
         }
 
         logger.LogWarning(
             "Workflow instance {WorkflowInstanceId} context payload update lost optimistic concurrency.",
             instance.Id);
 
-        return instance.Version;
+        return context.WorkflowInstanceVersion > 0
+            ? context.WorkflowInstanceVersion
+            : instance.Version;
     }
 
     private static WorkflowContext CreateContext(
@@ -248,6 +257,10 @@ public sealed class WorkflowWorkerService(
             instance.WorkflowId,
             instance.CorrelationId)
         {
+            WorkflowInstanceId = instance.Id,
+            WorkflowInstanceVersion = instance.Version,
+            WorkflowAttempt = instance.Attempt,
+            CommandId = instance.CommandId,
             State = instance.State
         };
 
