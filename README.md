@@ -29,8 +29,8 @@ This repository now contains a layered C# application for **Hemi Steak & Seafood
   - process payment
   - deduct inventory on close
   - close order
-- Saga-based orchestration endpoint to fulfill an order (kitchen -> payment -> inventory -> close) with compensation on failure
-- Saga persistence model on SQL Server with 4 tables: `SagaInstance`, `SagaStep`, `OutboxMessage`, and `InboxMessage` (schema file at `src/Infrastructure/Persistence/SagaCoreTables.sql`)
+- Workflow-based order fulfillment endpoint (kitchen -> payment -> inventory -> close) with compensation on failure
+- Legacy saga persistence model on SQL Server with 4 tables: `SagaInstance`, `SagaStep`, `OutboxMessage`, and `InboxMessage` (schema file at `src/Infrastructure/Persistence/SagaCoreTables.sql`)
 - Reservation creation and upcoming reservation listing
 - Inventory snapshot endpoint
 - Basic sales report endpoint
@@ -54,7 +54,7 @@ The API starts locally and exposes endpoints such as:
 - `POST /orders/{orderId}/send-to-kitchen`
 - `POST /orders/{orderId}/payments`
 - `POST /orders/{orderId}/close`
-- `POST /orders/{orderId}/fulfillment-saga`
+- `POST /orders/{orderId}/fulfillment-saga` (routes to the `order-fulfillment` workflow engine)
 - `GET /inventory`
 - `GET /reports/sales`
 - `GET /reservations/upcoming`

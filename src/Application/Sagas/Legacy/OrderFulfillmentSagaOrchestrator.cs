@@ -1,6 +1,7 @@
+using Hemi.Application;
 using Hemi.Domain;
 
-namespace Hemi.Application;
+namespace Hemi.Application.Sagas.Legacy;
 
 public enum SagaStepStatus
 {

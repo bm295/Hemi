@@ -1,3 +1,4 @@
+using Hemi.Application.Sagas.Legacy;
 using Hemi.Domain;
 
 namespace Hemi.Application;

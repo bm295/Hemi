@@ -1,5 +1,7 @@
 using Hemi.Application;
+using Hemi.Application.Sagas.Legacy;
 using Hemi.Application.Workflows.Abstractions;
+using Hemi.Application.Workflows.Contracts;
 using Hemi.Application.Workflows.Definitions.OrderFulfillment;
 using Hemi.Application.Workflows.Definitions.OrderFulfillment.Compensations;
 using Hemi.Application.Workflows.Definitions.OrderFulfillment.Steps;
@@ -209,16 +211,67 @@ app.MapPost("/orders/{orderId:guid}/close", async (Guid orderId, FnbManagementSe
     }
 });
 
-app.MapPost("/orders/{orderId:guid}/fulfillment-saga", async (Guid orderId, FulfillOrderSagaRequest request, FnbManagementService service, CancellationToken cancellationToken) =>
+app.MapPost("/orders/{orderId:guid}/fulfillment-saga", async (
+    Guid orderId,
+    FulfillOrderWorkflowRequest request,
+    WorkflowCommandQueue commandQueue,
+    IWorkflowRegistry workflowRegistry,
+    HttpRequest httpRequest,
+    CancellationToken cancellationToken) =>
 {
+    if (!workflowRegistry.TryGet(WorkflowIds.OrderFulfillment, out _))
+    {
+        return Results.NotFound(new WorkflowErrorResponse(
+            $"Workflow '{WorkflowIds.OrderFulfillment}' is not registered.",
+            Code: "workflow.not_found",
+            WorkflowId: WorkflowIds.OrderFulfillment,
+            CorrelationId: orderId.ToString("D")));
+    }
+
+    var items = new Dictionary<string, object?>
+    {
+        [OrderFulfillmentWorkflowContext.OrderId] = orderId.ToString("D"),
+        [OrderFulfillmentWorkflowContext.PaymentMethod] = request.Method.ToString()
+    };
+
+    if (request.Amount.HasValue)
+    {
+        items[OrderFulfillmentWorkflowContext.PaymentAmount] = request.Amount.Value;
+    }
+
+    var workflowCommand = new StartWorkflowCommand(
+        WorkflowIds.OrderFulfillment,
+        orderId.ToString("D"),
+        items,
+        ResolveIdempotencyKey(orderId, request, httpRequest),
+        request.RequestedBy ?? "orders-api",
+        DateTimeOffset.UtcNow);
+
     try
     {
-        var saga = await service.ExecuteOrderFulfillmentSagaAsync(orderId, request.Method, request.Amount, cancellationToken);
-        return Results.Ok(saga);
+        var response = await commandQueue.EnqueueAsync(
+            workflowCommand,
+            cancellationToken);
+
+        return Results.Accepted(
+            $"/workflows/{response.WorkflowId}",
+            response);
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.BadRequest(new WorkflowErrorResponse(
+            ex.Message,
+            Code: "workflow.request_invalid",
+            WorkflowId: workflowCommand.WorkflowId,
+            CorrelationId: workflowCommand.CorrelationId));
     }
     catch (InvalidOperationException ex)
     {
-        return Results.BadRequest(new { error = ex.Message });
+        return Results.Conflict(new WorkflowErrorResponse(
+            ex.Message,
+            Code: "workflow.idempotency_conflict",
+            WorkflowId: workflowCommand.WorkflowId,
+            CorrelationId: workflowCommand.CorrelationId));
     }
 });
 
@@ -273,6 +326,25 @@ app.MapWorkflowsEndpoints();
 
 app.Run();
 
+static string ResolveIdempotencyKey(
+    Guid orderId,
+    FulfillOrderWorkflowRequest request,
+    HttpRequest httpRequest)
+{
+    if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
+    {
+        return request.IdempotencyKey;
+    }
+
+    if (httpRequest.Headers.TryGetValue("Idempotency-Key", out var headerValue) &&
+        !string.IsNullOrWhiteSpace(headerValue.ToString()))
+    {
+        return headerValue.ToString();
+    }
+
+    return $"{WorkflowIds.OrderFulfillment}:{orderId:D}";
+}
+
 public sealed record CreateOrderRequest(Guid TableId, IReadOnlyCollection<CreateOrderItemRequest> Items);
 
 public sealed record CreateOrderItemRequest(Guid MenuItemId, int Quantity);
@@ -282,7 +354,12 @@ public sealed record AddOrderItemRequest(Guid MenuItemId, int Quantity);
 public sealed record RemoveOrderItemRequest(Guid MenuItemId, int Quantity);
 
 public sealed record ProcessPaymentRequest(decimal Amount, PaymentMethod Method);
-public sealed record FulfillOrderSagaRequest(PaymentMethod Method, decimal? Amount);
+
+public sealed record FulfillOrderWorkflowRequest(
+    PaymentMethod Method,
+    decimal? Amount,
+    string? IdempotencyKey = null,
+    string? RequestedBy = null);
 
 public sealed record CreateReservationRequest(
     string GuestName,

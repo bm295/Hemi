@@ -1,6 +1,7 @@
 using System.Data;
 using System.Text.Json;
 using Hemi.Application;
+using Hemi.Application.Sagas.Legacy;
 using Microsoft.Data.SqlClient;
 
 namespace Hemi.Infrastructure;

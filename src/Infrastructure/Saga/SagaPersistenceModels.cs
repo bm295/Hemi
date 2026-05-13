@@ -1,4 +1,5 @@
 using Hemi.Application;
+using Hemi.Application.Sagas.Legacy;
 
 namespace Hemi.Infrastructure;
 
