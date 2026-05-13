@@ -400,6 +400,7 @@ public sealed class OrderFulfillmentEndpointTests(
             int expectedVersion,
             string? lastError = null,
             DateTimeOffset? completedAtUtc = null,
+            DateTimeOffset? nextAttemptAtUtc = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult(false);
 

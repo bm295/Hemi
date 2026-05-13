@@ -336,6 +336,7 @@ public sealed class WorkflowInstanceRepository(string connectionString)
         int expectedVersion,
         string? lastError = null,
         DateTimeOffset? completedAtUtc = null,
+        DateTimeOffset? nextAttemptAtUtc = null,
         CancellationToken cancellationToken = default)
     {
         if (expectedVersion <= 0)
@@ -355,6 +356,7 @@ public sealed class WorkflowInstanceRepository(string connectionString)
                 Version = Version + 1,
                 UpdatedAtUtc = @UpdatedAtUtc,
                 CompletedAtUtc = @CompletedAtUtc,
+                NextAttemptAtUtc = @NextAttemptAtUtc,
                 LeaseOwner = CASE WHEN @ClearLease = 1 THEN NULL ELSE LeaseOwner END,
                 LeaseUntilUtc = CASE WHEN @ClearLease = 1 THEN NULL ELSE LeaseUntilUtc END
             WHERE Id = @Id AND Version = @ExpectedVersion;
@@ -368,7 +370,8 @@ public sealed class WorkflowInstanceRepository(string connectionString)
         _ = command.Parameters.Add("@UpdatedAtUtc", SqlDbType.DateTimeOffset).Value =
             DateTimeOffset.UtcNow;
         AddNullable(command, "@CompletedAtUtc", SqlDbType.DateTimeOffset, completedAtUtc);
-        _ = command.Parameters.Add("@ClearLease", SqlDbType.Bit).Value = IsTerminal(state);
+        AddNullable(command, "@NextAttemptAtUtc", SqlDbType.DateTimeOffset, nextAttemptAtUtc);
+        _ = command.Parameters.Add("@ClearLease", SqlDbType.Bit).Value = ShouldClearLease(state);
 
         return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
     }
@@ -714,12 +717,8 @@ public sealed class WorkflowInstanceRepository(string connectionString)
             requestHash,
             StringComparison.Ordinal);
 
-    private static bool IsTerminal(WorkflowState state) =>
-        state is WorkflowState.Succeeded
-            or WorkflowState.Failed
-            or WorkflowState.Compensated
-            or WorkflowState.CompensationFailed
-            or WorkflowState.Cancelled;
+    private static bool ShouldClearLease(WorkflowState state) =>
+        state != WorkflowState.Running;
 
     private static WorkflowState ParseWorkflowState(string raw) =>
         Enum.TryParse<WorkflowState>(raw, out var state)

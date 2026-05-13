@@ -75,6 +75,7 @@ public interface IWorkflowInstanceStore
         int expectedVersion,
         string? lastError = null,
         DateTimeOffset? completedAtUtc = null,
+        DateTimeOffset? nextAttemptAtUtc = null,
         CancellationToken cancellationToken = default);
 
     Task<bool> TryUpdatePayloadAsync(

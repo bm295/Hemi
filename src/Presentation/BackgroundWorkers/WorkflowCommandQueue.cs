@@ -1,7 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Threading.Channels;
 using Hemi.Application.Workflows.Abstractions;
 using Hemi.Application.Workflows.Contracts;
 
@@ -13,14 +12,6 @@ public sealed class WorkflowCommandQueue(
 {
     private static readonly JsonSerializerOptions SerializerOptions =
         new(JsonSerializerDefaults.Web);
-
-    private readonly Channel<WorkflowWorkerCommand> _commands =
-        Channel.CreateUnbounded<WorkflowWorkerCommand>(
-            new UnboundedChannelOptions
-            {
-                SingleReader = true,
-                SingleWriter = false
-            });
 
     public async Task<WorkflowAcceptedResponse> EnqueueAsync(
         StartWorkflowCommand request,
@@ -75,29 +66,8 @@ public sealed class WorkflowCommandQueue(
 
         var response = ToAcceptedResponse(instance);
 
-        if (startResult.Status == WorkflowStartStatus.Created)
-        {
-            var workerCommand = new WorkflowWorkerCommand(
-                instance.CommandId,
-                request.WorkflowId,
-                request.CorrelationId,
-                request.Items,
-                Attempt: instance.Attempt + 1,
-                instance.CreatedAtUtc,
-                idempotencyKey,
-                Source: request.RequestedBy ?? "api");
-
-            await _commands.Writer.WriteAsync(
-                workerCommand,
-                cancellationToken);
-        }
-
         return response;
     }
-
-    public IAsyncEnumerable<WorkflowWorkerCommand> ReadAllAsync(
-        CancellationToken cancellationToken = default) =>
-        _commands.Reader.ReadAllAsync(cancellationToken);
 
     private static void Validate(StartWorkflowCommand request)
     {
