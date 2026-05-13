@@ -1,5 +1,6 @@
 using Hemi.Application;
 using Hemi.Application.Workflows.Abstractions;
+using Hemi.Application.Workflows.Definitions.OrderFulfillment;
 using Hemi.Application.Workflows.Definitions.OrderFulfillment.Compensations;
 using Hemi.Application.Workflows.Definitions.OrderFulfillment.Steps;
 using Hemi.Application.Workflows.Execution;
@@ -8,6 +9,8 @@ using Hemi.Domain;
 using Hemi.Domain.Workflows;
 using Hemi.Infrastructure;
 using Hemi.Infrastructure.Messaging;
+using Hemi.Infrastructure.Monitoring;
+using Hemi.Infrastructure.WorkflowPersistence.Repositories;
 using Hemi.Presentation.BackgroundWorkers;
 using Hemi.Presentation.Endpoints;
 
@@ -42,8 +45,16 @@ builder.Services.AddSingleton<ISagaStateCommandPort>(sp => sp.GetRequiredService
 builder.Services.AddSingleton<OrderFulfillmentSagaOrchestrator>();
 builder.Services.AddSingleton<FnbManagementService>();
 
+builder.Services.AddSingleton(new WorkflowInstanceRepository(connectionString));
+builder.Services.AddSingleton(new WorkflowExecutionLogRepository(connectionString));
+builder.Services.AddSingleton<WorkflowMetrics>();
+builder.Services.AddSingleton<WorkflowTracing>();
+
 builder.Services.AddScoped<IWorkflowEngine, WorkflowEngine>();
 builder.Services.AddScoped<IWorkflowDispatcher, WorkflowDispatcher>();
+builder.Services.AddSingleton<OrderFulfillmentWorkflow>();
+builder.Services.AddSingleton<IWorkflowDefinition>(sp =>
+    sp.GetRequiredService<OrderFulfillmentWorkflow>());
 builder.Services.AddScoped<ReopenKitchenOrderCompensation>();
 builder.Services.AddScoped<RefundOrderPaymentCompensation>();
 builder.Services.AddScoped<RestoreOrderInventoryCompensation>();
@@ -51,8 +62,8 @@ builder.Services.AddScoped<SendOrderToKitchenStep>();
 builder.Services.AddScoped<CaptureOrderPaymentStep>();
 builder.Services.AddScoped<DeductOrderInventoryStep>();
 builder.Services.AddScoped<CloseOrderStep>();
-builder.Services.AddSingleton<IWorkflowRegistry>(
-    WorkflowRegistry.RegisterAllWorkflows());
+builder.Services.AddSingleton<IWorkflowRegistry>(sp =>
+    new WorkflowRegistry(sp.GetRequiredService<IEnumerable<IWorkflowDefinition>>()));
 builder.Services.AddSingleton(new WorkflowPolicyRegistration(
     WorkflowIds.OrderFulfillment,
     WorkflowPolicies.Default));
@@ -63,7 +74,8 @@ builder.Services.AddSingleton(new WorkflowPolicyRegistration(
     WorkflowIds.InventoryReconciliation,
     WorkflowPolicies.Default));
 builder.Services.AddSingleton<IRetryPolicyProvider, RetryPolicyProvider>();
-builder.Services.AddSingleton<IWorkflowEventPublisher, NoOpWorkflowEventPublisher>();
+builder.Services.AddSingleton<IWorkflowMessagePublisher, InMemoryWorkflowMessagePublisher>();
+builder.Services.AddSingleton<IWorkflowEventPublisher, WorkflowEventPublisher>();
 builder.Services.AddSingleton<WorkflowCommandQueue>();
 builder.Services.AddScoped<WorkflowCommandSubscriber>();
 builder.Services.AddHostedService<WorkflowWorkerService>();
