@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Hemi.Application.Sagas.Legacy;
 using Hemi.Application.Workflows.Abstractions;
 using Hemi.Application.Workflows.Contracts;
 using Hemi.Application.Workflows.Definitions.OrderFulfillment;
@@ -358,6 +359,17 @@ public sealed class OrderFulfillmentEndpointTests(
         Assert.Same(
             factory.WorkflowInstanceStore,
             services.GetRequiredService<IWorkflowInstanceStore>());
+    }
+
+    [Fact]
+    public void Legacy_saga_runtime_is_query_only_for_fallback_reads()
+    {
+        using var scope = factory.Services.CreateScope();
+        var services = scope.ServiceProvider;
+
+        Assert.NotNull(
+            services.GetRequiredService<LegacyOrderFulfillmentSagaQueryService>());
+        Assert.Null(services.GetService<OrderFulfillmentSagaOrchestrator>());
     }
 
     private static async Task<HttpResponseMessage> SendWithIdempotencyKeyAsync(

@@ -1,4 +1,3 @@
-using Hemi.Application.Sagas.Legacy;
 using Hemi.Domain;
 
 namespace Hemi.Application;
@@ -14,8 +13,7 @@ public sealed class FnbManagementService(
     IInventoryQueryPort inventoryQueryPort,
     IInventoryCommandPort inventoryCommandPort,
     IPaymentQueryPort paymentQueryPort,
-    IPaymentCommandPort paymentCommandPort,
-    OrderFulfillmentSagaOrchestrator orderFulfillmentSagaOrchestrator)
+    IPaymentCommandPort paymentCommandPort)
 {
     public Task<RestaurantProfile> GetProfileAsync(CancellationToken cancellationToken = default) =>
         restaurantQueryPort.GetRestaurantProfileAsync(cancellationToken);
@@ -44,12 +42,6 @@ public sealed class FnbManagementService(
 
     public Task<IReadOnlyCollection<InventoryItem>> GetInventoryAsync(CancellationToken cancellationToken = default) =>
         inventoryQueryPort.GetInventoryAsync(cancellationToken);
-
-    public Task<OrderFulfillmentSagaState> ExecuteOrderFulfillmentSagaAsync(Guid orderId, PaymentMethod paymentMethod, decimal? paymentAmount = null, CancellationToken cancellationToken = default) =>
-        orderFulfillmentSagaOrchestrator.ExecuteAsync(orderId, paymentMethod, paymentAmount, cancellationToken);
-
-    public Task<OrderFulfillmentSagaState?> GetOrderFulfillmentSagaStateAsync(Guid orderId, CancellationToken cancellationToken = default) =>
-        orderFulfillmentSagaOrchestrator.GetSagaStateAsync(orderId, cancellationToken);
 
     public async Task<SalesReport> GetSalesReportAsync(DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken = default)
     {

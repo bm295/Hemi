@@ -43,9 +43,8 @@ builder.Services.AddSingleton<IPaymentCommandPort>(sp => sp.GetRequiredService<I
 builder.Services.AddSingleton<IInventoryQueryPort>(sp => sp.GetRequiredService<InMemoryInventoryAdapter>());
 builder.Services.AddSingleton<IInventoryCommandPort>(sp => sp.GetRequiredService<InMemoryInventoryAdapter>());
 builder.Services.AddSingleton<ISagaStateQueryPort>(sp => sp.GetRequiredService<SqlServerSagaStateAdapter>());
-builder.Services.AddSingleton<ISagaStateCommandPort>(sp => sp.GetRequiredService<SqlServerSagaStateAdapter>());
 
-builder.Services.AddSingleton<OrderFulfillmentSagaOrchestrator>();
+builder.Services.AddSingleton<LegacyOrderFulfillmentSagaQueryService>();
 builder.Services.AddSingleton<FnbManagementService>();
 
 builder.Services.AddSingleton(_ => new WorkflowInstanceRepository(connectionString));
@@ -296,7 +295,7 @@ app.MapGet("/orders/{orderId:guid}/fulfillment-saga", async (
     Guid orderId,
     IWorkflowInstanceStore workflowInstanceStore,
     IWorkflowExecutionLogStore workflowExecutionLogStore,
-    FnbManagementService service,
+    LegacyOrderFulfillmentSagaQueryService legacySagaQueryService,
     CancellationToken cancellationToken) =>
 {
     var correlationId = orderId.ToString("D");
@@ -315,7 +314,7 @@ app.MapGet("/orders/{orderId:guid}/fulfillment-saga", async (
         return Results.Ok(response);
     }
 
-    var saga = await service.GetOrderFulfillmentSagaStateAsync(orderId, cancellationToken);
+    var saga = await legacySagaQueryService.GetSagaStateAsync(orderId, cancellationToken);
     return saga is null
         ? Results.NotFound(new { error = "Saga state not found for this order." })
         : Results.Ok(saga);
