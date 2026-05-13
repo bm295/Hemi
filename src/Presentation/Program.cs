@@ -38,6 +38,7 @@ builder.Services.AddSingleton<FnbManagementService>();
 builder.Services.AddScoped<IWorkflowEngine, WorkflowEngine>();
 builder.Services.AddScoped<IWorkflowDispatcher, WorkflowDispatcher>();
 builder.Services.AddSingleton<IRetryPolicyProvider, RetryPolicyProvider>();
+builder.Services.AddSingleton<IWorkflowEventPublisher, NoOpWorkflowEventPublisher>();
 
 var app = builder.Build();
 
