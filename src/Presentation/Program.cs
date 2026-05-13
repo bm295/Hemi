@@ -1,5 +1,7 @@
 using Hemi.Application;
 using Hemi.Application.Workflows.Abstractions;
+using Hemi.Application.Workflows.Definitions.OrderFulfillment.Compensations;
+using Hemi.Application.Workflows.Definitions.OrderFulfillment.Steps;
 using Hemi.Application.Workflows.Execution;
 using Hemi.Application.Workflows.Registry;
 using Hemi.Domain;
@@ -39,6 +41,13 @@ builder.Services.AddSingleton<FnbManagementService>();
 
 builder.Services.AddScoped<IWorkflowEngine, WorkflowEngine>();
 builder.Services.AddScoped<IWorkflowDispatcher, WorkflowDispatcher>();
+builder.Services.AddScoped<ReopenKitchenOrderCompensation>();
+builder.Services.AddScoped<RefundOrderPaymentCompensation>();
+builder.Services.AddScoped<RestoreOrderInventoryCompensation>();
+builder.Services.AddScoped<SendOrderToKitchenStep>();
+builder.Services.AddScoped<CaptureOrderPaymentStep>();
+builder.Services.AddScoped<DeductOrderInventoryStep>();
+builder.Services.AddScoped<CloseOrderStep>();
 builder.Services.AddSingleton<IWorkflowRegistry>(
     WorkflowRegistry.RegisterAllWorkflows());
 builder.Services.AddSingleton(new WorkflowPolicyRegistration(

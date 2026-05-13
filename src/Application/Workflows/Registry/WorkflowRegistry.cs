@@ -1,4 +1,5 @@
 using Hemi.Application.Workflows.Abstractions;
+using Hemi.Application.Workflows.Definitions.OrderFulfillment;
 using Hemi.Domain.Workflows;
 
 namespace Hemi.Application.Workflows.Registry;
@@ -85,7 +86,7 @@ public sealed class WorkflowRegistry : IWorkflowRegistry
 
     public WorkflowRegistry RegisterAll() =>
         this
-            .Register(WorkflowIds.OrderFulfillment)
+            .Register(new OrderFulfillmentWorkflow())
             .Register(WorkflowIds.OrderCancellation)
             .Register(WorkflowIds.PaymentConfirmation)
             .Register(WorkflowIds.InventoryDeduction)

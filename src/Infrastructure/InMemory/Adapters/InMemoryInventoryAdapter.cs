@@ -13,6 +13,18 @@ public sealed class InMemoryInventoryAdapter(InMemoryFnbStore store) : IInventor
         var order = store.Orders.SingleOrDefault(x => x.Id == orderId)
             ?? throw new InvalidOperationException("Order not found.");
 
+        foreach (var lineGroup in order.Lines.GroupBy(line => line.MenuItemId))
+        {
+            var inventoryItem = store.Inventory.SingleOrDefault(x => x.MenuItemId == lineGroup.Key)
+                ?? throw new InvalidOperationException("Inventory item mapping not found.");
+
+            var requiredQuantity = lineGroup.Sum(line => line.Quantity);
+            if (inventoryItem.StockQuantity - requiredQuantity < 0)
+            {
+                throw new InvalidOperationException($"Insufficient inventory for '{inventoryItem.Name}'.");
+            }
+        }
+
         var movements = new List<StockMovement>();
 
         foreach (var line in order.Lines)
