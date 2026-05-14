@@ -69,10 +69,10 @@ The API starts locally and exposes endpoints such as:
 The active fulfillment runtime is the durable workflow orchestrator:
 
 - `POST /orders/{orderId}/fulfillment-saga` keeps the historical route name but enqueues the `order-fulfillment` workflow.
-- `WorkflowWorkerService` atomically claims due `WorkflowInstance` rows using SQL leases, dispatches the workflow, and lets expired leases be recovered by another worker.
+- `WorkflowWorkerService` atomically claims due `WorkflowInstance` rows using SQL leases, dispatches the workflow, and lets expired leases be recovered by another worker. Workflow leases are fencing tokens: state, payload, and journal commits must match the current lease owner.
 - `WorkflowEngine` records every step execution attempt, including internal retries, and persists compensation outcomes.
 - `SqlServerWorkflowJournal` persists state, payload, step attempt, and outbox event changes together for durable workflow transitions.
-- `OutboxWorkflowEventPublisher` writes lifecycle events to `WorkflowOutboxMessage`; `WorkflowOutboxPublisher` atomically claims outbox rows, publishes them, retries failures, and clears leases on terminal outcomes.
+- `OutboxWorkflowEventPublisher` writes lifecycle events to `WorkflowOutboxMessage`; `WorkflowOutboxPublisher` atomically claims outbox rows, publishes them, retries failures, and clears leases on terminal outcomes. Outbox leases are also fencing tokens, so stale publishers cannot complete messages after ownership changes.
 
 The SQL schema for this path is `src/Infrastructure/WorkflowPersistence/Sql/WorkflowTables.sql`. It is idempotent and should be applied before running SQL-backed workers. SQL Server integration tests are gated by `HEMI_TEST_SQLSERVER_CONNECTION_STRING`.
 

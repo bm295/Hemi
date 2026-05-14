@@ -75,7 +75,7 @@ Fulfillment hardening:
 - **Durable orchestrator path**: `POST /orders/{orderId}/fulfillment-saga` enqueues the `order-fulfillment` workflow despite the compatibility-oriented route name.
 - **SQL workflow state**: `WorkflowInstance`, `WorkflowStepExecution`, and `WorkflowOutboxMessage` track workflow state, step attempt history, and events.
 - **SQL schema gating**: the idempotent workflow schema is in `src/Infrastructure/WorkflowPersistence/Sql/WorkflowTables.sql`; SQL integration tests require `HEMI_TEST_SQLSERVER_CONNECTION_STRING`.
-- **Lease recovery**: workflow workers and outbox publishers claim due rows with SQL leases and allow expired leases to be reclaimed.
+- **Lease recovery**: workflow workers and outbox publishers claim due rows with SQL leases and allow expired leases to be reclaimed; those leases also act as fencing tokens for completion writes.
 - **Idempotency**: idempotency keys, request hashes, and workflow/correlation uniqueness prevent duplicate or conflicting starts.
 - **Compensation**: failed workflows compensate completed kitchen, payment, and inventory steps in reverse order.
 - **Outbox**: workflow events are stored durably and published asynchronously from claimed outbox rows.

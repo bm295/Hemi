@@ -75,10 +75,15 @@ instances atomically with update locks, `READPAST`, and lease expiry:
 - expired leases can be reclaimed by another worker;
 - terminal state updates clear workflow leases.
 
+Workflow leases are fencing tokens, not only selection hints. A worker that no
+longer owns the row must not be able to complete a state transition or journal
+commit after another worker has reclaimed the workflow.
+
 The outbox uses the same model. `WorkflowOutboxPublisher` claims pending
 messages with a lease owner and lease expiry, publishes only claimed messages,
 and clears leases when messages are published or transition to retry/failed
-state.
+state. Outbox message completion is fenced by `LeaseOwner`, so stale publishers
+cannot mark messages published or failed after ownership changes.
 
 ## Compensation
 
@@ -106,7 +111,8 @@ the durable workflow path. Outbox messages include:
 - `PublishedAtUtc` for terminal success.
 
 The publisher claims eligible messages atomically, skips active leases, retries
-transient failures, and marks exhausted messages as failed.
+transient failures, and marks exhausted messages as failed only while it still
+owns the outbox lease.
 
 ## Legacy Saga Boundary
 

@@ -4,6 +4,8 @@ public static class WorkflowEvents
 {
     public const string WorkflowStarted = "workflow.started";
 
+    public const string RetryScheduled = "workflow.retry_scheduled";
+
     public const string StepStarted = "workflow.step.started";
 
     public const string StepCompleted = "workflow.step.completed";

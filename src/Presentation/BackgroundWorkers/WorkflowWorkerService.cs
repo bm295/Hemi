@@ -13,12 +13,15 @@ public sealed class WorkflowWorkerService(
     IWorkflowInstanceStore workflowInstanceStore,
     ILogger<WorkflowWorkerService> logger,
     WorkflowMetrics? workflowMetrics = null,
-    WorkflowTracing? workflowTracing = null)
+    WorkflowTracing? workflowTracing = null,
+    IWorkflowJournal? workflowJournal = null)
     : BackgroundService
 {
     private const int BatchSize = 10;
+    private const int MaxDispatchAttempts = 3;
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan LeaseDuration = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan DispatchRetryDelay = TimeSpan.FromSeconds(2);
     private static readonly JsonSerializerOptions SerializerOptions =
         new(JsonSerializerDefaults.Web);
 
@@ -154,17 +157,127 @@ public sealed class WorkflowWorkerService(
             return;
         }
 
+        if (instance.Attempt >= MaxDispatchAttempts)
+        {
+            await PersistTerminalDispatchFailureAsync(
+                instance,
+                context,
+                exception,
+                cancellationToken);
+            return;
+        }
+
+        await ScheduleDispatchRetryAsync(
+            instance,
+            context,
+            exception,
+            DateTimeOffset.UtcNow.Add(DispatchRetryDelay),
+            cancellationToken);
+    }
+
+    private async Task ScheduleDispatchRetryAsync(
+        WorkflowInstanceRecord instance,
+        WorkflowContext context,
+        Exception exception,
+        DateTimeOffset nextAttemptAtUtc,
+        CancellationToken cancellationToken)
+    {
+        context.State = WorkflowState.Pending;
+        var payloadJson = SerializeContext(context);
+
+        if (CanUseJournal(context))
+        {
+            await AppendWorkflowStateTransitionAsync(
+                context,
+                new WorkflowStateTransitionJournalEntry(
+                    instance.Id,
+                    context.WorkflowInstanceVersion,
+                    GetRequiredWorkflowLeaseOwner(context),
+                    State: new WorkflowStateJournalEntry(
+                        State: WorkflowState.Pending,
+                        LastError: exception.Message,
+                        CompletedAtUtc: null,
+                        NextAttemptAtUtc: nextAttemptAtUtc,
+                        ClearLease: true),
+                    Event: CreateWorkflowEvent(
+                        instance,
+                        context,
+                        WorkflowEvents.RetryScheduled,
+                        exception,
+                        DateTimeOffset.UtcNow),
+                    PayloadJson: payloadJson),
+                cancellationToken);
+            return;
+        }
+
         var version = await PersistContextPayloadAsync(
             instance,
             context,
+            payloadJson,
+            cancellationToken);
+
+        if (!await workflowInstanceStore.TryUpdateStateAsync(
+                instance.Id,
+                WorkflowState.Pending,
+                version,
+                lastError: exception.Message,
+                completedAtUtc: null,
+                nextAttemptAtUtc,
+                cancellationToken))
+        {
+            logger.LogWarning(
+                "Workflow instance {WorkflowInstanceId} retry schedule update lost optimistic concurrency.",
+                instance.Id);
+        }
+    }
+
+    private async Task PersistTerminalDispatchFailureAsync(
+        WorkflowInstanceRecord instance,
+        WorkflowContext context,
+        Exception exception,
+        CancellationToken cancellationToken)
+    {
+        context.State = WorkflowState.Failed;
+        var failedAtUtc = DateTimeOffset.UtcNow;
+        var payloadJson = SerializeContext(context);
+
+        if (CanUseJournal(context))
+        {
+            await AppendWorkflowStateTransitionAsync(
+                context,
+                new WorkflowStateTransitionJournalEntry(
+                    instance.Id,
+                    context.WorkflowInstanceVersion,
+                    GetRequiredWorkflowLeaseOwner(context),
+                    State: new WorkflowStateJournalEntry(
+                        State: WorkflowState.Failed,
+                        LastError: exception.Message,
+                        CompletedAtUtc: failedAtUtc,
+                        NextAttemptAtUtc: null,
+                        ClearLease: true),
+                    Event: CreateWorkflowEvent(
+                        instance,
+                        context,
+                        WorkflowEvents.WorkflowFailed,
+                        exception,
+                        failedAtUtc),
+                    PayloadJson: payloadJson),
+                cancellationToken);
+            return;
+        }
+
+        var version = await PersistContextPayloadAsync(
+            instance,
+            context,
+            payloadJson,
             cancellationToken);
 
         if (!await workflowInstanceStore.TryUpdateStateAsync(
                 instance.Id,
                 WorkflowState.Failed,
                 version,
-                lastError: exception.Message,
-                completedAtUtc: DateTimeOffset.UtcNow,
+                exception.Message,
+                failedAtUtc,
                 nextAttemptAtUtc: null,
                 cancellationToken))
         {
@@ -177,12 +290,9 @@ public sealed class WorkflowWorkerService(
     private async Task<int> PersistContextPayloadAsync(
         WorkflowInstanceRecord instance,
         WorkflowContext context,
+        string payloadJson,
         CancellationToken cancellationToken)
     {
-        var payloadJson = JsonSerializer.Serialize(
-            context.Items,
-            SerializerOptions);
-
         if (await workflowInstanceStore.TryUpdatePayloadAsync(
                 instance.Id,
                 context.WorkflowInstanceVersion > 0
@@ -207,6 +317,59 @@ public sealed class WorkflowWorkerService(
             ? context.WorkflowInstanceVersion
             : instance.Version;
     }
+
+    private static string SerializeContext(WorkflowContext context) =>
+        JsonSerializer.Serialize(
+            context.Items,
+            SerializerOptions);
+
+    private async Task AppendWorkflowStateTransitionAsync(
+        WorkflowContext context,
+        WorkflowStateTransitionJournalEntry entry,
+        CancellationToken cancellationToken)
+    {
+        var result = await workflowJournal!.AppendWorkflowStateTransitionAsync(
+            entry,
+            cancellationToken);
+
+        context.WorkflowInstanceVersion = result.WorkflowInstanceVersion;
+    }
+
+    private bool CanUseJournal(WorkflowContext context) =>
+        workflowJournal is not null &&
+        context.WorkflowInstanceId.HasValue &&
+        context.WorkflowInstanceVersion > 0 &&
+        !string.IsNullOrWhiteSpace(context.WorkflowLeaseOwner);
+
+    private static string GetRequiredWorkflowLeaseOwner(WorkflowContext context)
+    {
+        if (string.IsNullOrWhiteSpace(context.WorkflowLeaseOwner))
+        {
+            throw new InvalidOperationException(
+                "Workflow journal writes require an active workflow lease owner.");
+        }
+
+        return context.WorkflowLeaseOwner;
+    }
+
+    private static WorkflowEvent CreateWorkflowEvent(
+        WorkflowInstanceRecord instance,
+        WorkflowContext context,
+        string eventName,
+        Exception exception,
+        DateTimeOffset occurredAtUtc) =>
+        new(
+            eventName,
+            instance.WorkflowId,
+            instance.WorkflowName,
+            instance.CorrelationId,
+            context.State,
+            StepName: null,
+            Error: exception,
+            OccurredAtUtc: occurredAtUtc)
+        {
+            WorkflowInstanceId = instance.Id
+        };
 
     private static WorkflowContext CreateContext(
         WorkflowInstanceRecord instance)

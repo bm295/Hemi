@@ -49,7 +49,7 @@ public sealed class WorkflowWorkerServiceTests
     }
 
     [Fact]
-    public async Task Worker_marks_non_terminal_dispatch_failure_failed()
+    public async Task Worker_schedules_retry_for_non_terminal_dispatch_failure()
     {
         var instance = CreateInstance(
             attempt: 1,
@@ -64,16 +64,121 @@ public sealed class WorkflowWorkerServiceTests
             services,
             store);
 
+        var startedAtUtc = DateTimeOffset.UtcNow;
+        await worker.StartAsync(CancellationToken.None);
+
+        _ = await store.StateUpdated.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await worker.StopAsync(CancellationToken.None);
+
+        Assert.Equal(WorkflowState.Pending, store.State);
+        Assert.Equal("temporary workflow failure", store.LastError);
+        Assert.Null(store.CompletedAtUtc);
+        Assert.NotNull(store.NextAttemptAtUtc);
+        Assert.True(store.NextAttemptAtUtc >= startedAtUtc.AddSeconds(2));
+        Assert.Equal(instance.Version + 1, store.StateExpectedVersion);
+    }
+
+    [Fact]
+    public async Task Worker_marks_dispatch_failure_failed_after_retry_exhaustion()
+    {
+        var instance = CreateInstance(
+            attempt: 3,
+            version: 6,
+            payloadJson: """{"marker":"exhausted"}""");
+        var store = new PollingWorkflowInstanceStore(instance);
+        var dispatcher = new RecordingDispatcher(_ =>
+            throw new InvalidOperationException("dispatch retries exhausted"));
+
+        using var services = CreateServices(dispatcher);
+        using var worker = CreateWorker(
+            services,
+            store);
+
         await worker.StartAsync(CancellationToken.None);
 
         _ = await store.StateUpdated.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await worker.StopAsync(CancellationToken.None);
 
         Assert.Equal(WorkflowState.Failed, store.State);
-        Assert.Equal("temporary workflow failure", store.LastError);
+        Assert.Equal("dispatch retries exhausted", store.LastError);
         Assert.NotNull(store.CompletedAtUtc);
         Assert.Null(store.NextAttemptAtUtc);
         Assert.Equal(instance.Version + 1, store.StateExpectedVersion);
+    }
+
+    [Fact]
+    public async Task Worker_journals_retry_schedule_when_available()
+    {
+        var instance = CreateInstance(
+            attempt: 1,
+            version: 4,
+            payloadJson: """{"marker":"journal-retry"}""");
+        var store = new PollingWorkflowInstanceStore(instance);
+        var journal = new RecordingWorkflowJournal();
+        var dispatcher = new RecordingDispatcher(context =>
+        {
+            context.Set("dispatchFailure", "retry");
+            throw new InvalidOperationException("temporary workflow failure");
+        });
+
+        using var services = CreateServices(dispatcher);
+        using var worker = CreateWorker(
+            services,
+            store,
+            workflowJournal: journal);
+
+        await worker.StartAsync(CancellationToken.None);
+
+        var entry = await journal.StateTransitionAppended.Task.WaitAsync(
+            TimeSpan.FromSeconds(5));
+        await worker.StopAsync(CancellationToken.None);
+
+        Assert.Null(store.State);
+        Assert.Equal(WorkflowState.Pending, entry.State.State);
+        Assert.Equal("temporary workflow failure", entry.State.LastError);
+        Assert.NotNull(entry.State.NextAttemptAtUtc);
+        Assert.True(entry.State.ClearLease);
+        Assert.Equal(WorkflowEvents.RetryScheduled, entry.Event.EventName);
+        Assert.Equal(WorkflowState.Pending, entry.Event.State);
+        Assert.Contains(@"""dispatchFailure"":""retry""", entry.PayloadJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Worker_journals_terminal_failed_after_dispatch_retry_exhaustion()
+    {
+        var instance = CreateInstance(
+            attempt: 3,
+            version: 6,
+            payloadJson: """{"marker":"journal-exhausted"}""");
+        var store = new PollingWorkflowInstanceStore(instance);
+        var journal = new RecordingWorkflowJournal();
+        var dispatcher = new RecordingDispatcher(context =>
+        {
+            context.Set("dispatchFailure", "exhausted");
+            throw new InvalidOperationException("dispatch retries exhausted");
+        });
+
+        using var services = CreateServices(dispatcher);
+        using var worker = CreateWorker(
+            services,
+            store,
+            workflowJournal: journal);
+
+        await worker.StartAsync(CancellationToken.None);
+
+        var entry = await journal.StateTransitionAppended.Task.WaitAsync(
+            TimeSpan.FromSeconds(5));
+        await worker.StopAsync(CancellationToken.None);
+
+        Assert.Null(store.State);
+        Assert.Equal(WorkflowState.Failed, entry.State.State);
+        Assert.Equal("dispatch retries exhausted", entry.State.LastError);
+        Assert.NotNull(entry.State.CompletedAtUtc);
+        Assert.Null(entry.State.NextAttemptAtUtc);
+        Assert.True(entry.State.ClearLease);
+        Assert.Equal(WorkflowEvents.WorkflowFailed, entry.Event.EventName);
+        Assert.Equal(WorkflowState.Failed, entry.Event.State);
+        Assert.Contains(@"""dispatchFailure"":""exhausted""", entry.PayloadJson, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -246,12 +351,14 @@ public sealed class WorkflowWorkerServiceTests
     private static WorkflowWorkerService CreateWorker(
         ServiceProvider services,
         IWorkflowInstanceStore store,
-        WorkflowMetrics? workflowMetrics = null) =>
+        WorkflowMetrics? workflowMetrics = null,
+        IWorkflowJournal? workflowJournal = null) =>
         new(
             services.GetRequiredService<IServiceScopeFactory>(),
             store,
             NullLogger<WorkflowWorkerService>.Instance,
-            workflowMetrics);
+            workflowMetrics,
+            workflowJournal: workflowJournal);
 
     private static async Task<IReadOnlyCollection<string>> CaptureCommandMetricOutcomesAsync(
         Func<WorkflowMetrics, Task> action)
@@ -355,6 +462,39 @@ public sealed class WorkflowWorkerServiceTests
                 throw;
             }
         }
+    }
+
+    private sealed class RecordingWorkflowJournal : IWorkflowJournal
+    {
+        public TaskCompletionSource<WorkflowStateTransitionJournalEntry> StateTransitionAppended { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<WorkflowJournalResult> UpdateWorkflowPayloadAsync(
+            WorkflowPayloadJournalEntry entry,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
+
+        public Task<WorkflowJournalResult> AppendWorkflowStateTransitionAsync(
+            WorkflowStateTransitionJournalEntry entry,
+            CancellationToken cancellationToken = default)
+        {
+            StateTransitionAppended.TrySetResult(entry);
+
+            var version = entry.ExpectedWorkflowVersion;
+            if (entry.PayloadJson is not null)
+            {
+                version++;
+            }
+
+            version++;
+
+            return Task.FromResult(new WorkflowJournalResult(version));
+        }
+
+        public Task<WorkflowJournalResult> AppendStepAttemptTransitionAsync(
+            WorkflowStepAttemptTransitionJournalEntry entry,
+            CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class PollingWorkflowInstanceStore(
