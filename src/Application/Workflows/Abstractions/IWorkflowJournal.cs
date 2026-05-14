@@ -28,6 +28,25 @@ public sealed record WorkflowStepJournalEntry(
     DateTimeOffset? CompletedAtUtc = null,
     DateTimeOffset? CompensatedAtUtc = null);
 
+public sealed record WorkflowPayloadJournalEntry(
+    Guid WorkflowInstanceId,
+    int ExpectedWorkflowVersion,
+    string PayloadJson);
+
+public sealed record WorkflowStateTransitionJournalEntry(
+    Guid WorkflowInstanceId,
+    int ExpectedWorkflowVersion,
+    WorkflowStateJournalEntry State,
+    WorkflowEvent Event,
+    string? PayloadJson = null);
+
+public sealed record WorkflowStepAttemptTransitionJournalEntry(
+    Guid WorkflowInstanceId,
+    int ExpectedWorkflowVersion,
+    WorkflowStepJournalEntry Step,
+    WorkflowEvent Event,
+    string? PayloadJson = null);
+
 public sealed record WorkflowJournalEntry(
     Guid WorkflowInstanceId,
     int ExpectedWorkflowVersion,
@@ -42,7 +61,43 @@ public sealed record WorkflowJournalResult(
 
 public interface IWorkflowJournal
 {
+    Task<WorkflowJournalResult> UpdateWorkflowPayloadAsync(
+        WorkflowPayloadJournalEntry entry,
+        CancellationToken cancellationToken = default) =>
+        AppendAsync(
+            new WorkflowJournalEntry(
+                entry.WorkflowInstanceId,
+                entry.ExpectedWorkflowVersion,
+                PayloadJson: entry.PayloadJson),
+            cancellationToken);
+
+    Task<WorkflowJournalResult> AppendWorkflowStateTransitionAsync(
+        WorkflowStateTransitionJournalEntry entry,
+        CancellationToken cancellationToken = default) =>
+        AppendAsync(
+            new WorkflowJournalEntry(
+                entry.WorkflowInstanceId,
+                entry.ExpectedWorkflowVersion,
+                PayloadJson: entry.PayloadJson,
+                State: entry.State,
+                Event: entry.Event),
+            cancellationToken);
+
+    Task<WorkflowJournalResult> AppendStepAttemptTransitionAsync(
+        WorkflowStepAttemptTransitionJournalEntry entry,
+        CancellationToken cancellationToken = default) =>
+        AppendAsync(
+            new WorkflowJournalEntry(
+                entry.WorkflowInstanceId,
+                entry.ExpectedWorkflowVersion,
+                PayloadJson: entry.PayloadJson,
+                Step: entry.Step,
+                Event: entry.Event),
+            cancellationToken);
+
     Task<WorkflowJournalResult> AppendAsync(
         WorkflowJournalEntry entry,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default) =>
+        throw new NotSupportedException(
+            "This workflow journal implementation does not support generic journal appends.");
 }

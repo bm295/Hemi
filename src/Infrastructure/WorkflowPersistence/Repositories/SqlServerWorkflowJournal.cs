@@ -18,7 +18,64 @@ public sealed class SqlServerWorkflowJournal(
     private static readonly JsonSerializerOptions SerializerOptions =
         new(JsonSerializerDefaults.Web);
 
+    public Task<WorkflowJournalResult> UpdateWorkflowPayloadAsync(
+        WorkflowPayloadJournalEntry entry,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+
+        return AppendCoreAsync(
+            new WorkflowJournalEntry(
+                entry.WorkflowInstanceId,
+                entry.ExpectedWorkflowVersion,
+                PayloadJson: entry.PayloadJson),
+            cancellationToken);
+    }
+
+    public Task<WorkflowJournalResult> AppendWorkflowStateTransitionAsync(
+        WorkflowStateTransitionJournalEntry entry,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(entry.State);
+        ArgumentNullException.ThrowIfNull(entry.Event);
+
+        return AppendCoreAsync(
+            new WorkflowJournalEntry(
+                entry.WorkflowInstanceId,
+                entry.ExpectedWorkflowVersion,
+                PayloadJson: entry.PayloadJson,
+                State: entry.State,
+                Event: entry.Event),
+            cancellationToken);
+    }
+
+    public Task<WorkflowJournalResult> AppendStepAttemptTransitionAsync(
+        WorkflowStepAttemptTransitionJournalEntry entry,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(entry);
+        ArgumentNullException.ThrowIfNull(entry.Step);
+        ArgumentNullException.ThrowIfNull(entry.Event);
+
+        return AppendCoreAsync(
+            new WorkflowJournalEntry(
+                entry.WorkflowInstanceId,
+                entry.ExpectedWorkflowVersion,
+                PayloadJson: entry.PayloadJson,
+                Step: entry.Step,
+                Event: entry.Event),
+            cancellationToken);
+    }
+
     public async Task<WorkflowJournalResult> AppendAsync(
+        WorkflowJournalEntry entry,
+        CancellationToken cancellationToken = default) =>
+        await AppendCoreAsync(
+            entry,
+            cancellationToken);
+
+    private async Task<WorkflowJournalResult> AppendCoreAsync(
         WorkflowJournalEntry entry,
         CancellationToken cancellationToken = default)
     {

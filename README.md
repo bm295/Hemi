@@ -29,8 +29,10 @@ This repository now contains a layered C# application for **Hemi Steak & Seafood
   - process payment
   - deduct inventory on close
   - close order
-- Workflow-based order fulfillment endpoint (kitchen -> payment -> inventory -> close) with compensation on failure
-- Legacy saga persistence model on SQL Server with 4 tables: `SagaInstance`, `SagaStep`, `OutboxMessage`, and `InboxMessage` (schema file at `src/Infrastructure/Persistence/SagaCoreTables.sql`)
+- Durable workflow-based order fulfillment endpoint (kitchen -> payment -> inventory -> close) with compensation on failure
+- SQL-backed workflow persistence for instances, step attempts, and workflow outbox messages
+- Idempotent workflow starts with correlation conflict protection
+- Worker and outbox lease recovery for safe polling across multiple processes
 - Reservation creation and upcoming reservation listing
 - Inventory snapshot endpoint
 - Basic sales report endpoint
@@ -55,8 +57,25 @@ The API starts locally and exposes endpoints such as:
 - `POST /orders/{orderId}/payments`
 - `POST /orders/{orderId}/close`
 - `POST /orders/{orderId}/fulfillment-saga` (routes to the `order-fulfillment` workflow engine)
+- `GET /orders/{orderId}/fulfillment-saga` (returns durable workflow status, with legacy read fallback)
 - `GET /inventory`
 - `GET /reports/sales`
 - `GET /reservations/upcoming`
 - `POST /reservations`
 - `POST /integrations/food-app/orders`
+
+## Durable order fulfillment
+
+The active fulfillment runtime is the durable workflow orchestrator:
+
+- `POST /orders/{orderId}/fulfillment-saga` keeps the historical route name but enqueues the `order-fulfillment` workflow.
+- `WorkflowWorkerService` atomically claims due `WorkflowInstance` rows using SQL leases, dispatches the workflow, and lets expired leases be recovered by another worker.
+- `WorkflowEngine` records every step execution attempt, including internal retries, and persists compensation outcomes.
+- `SqlServerWorkflowJournal` persists state, payload, step attempt, and outbox event changes together for durable workflow transitions.
+- `OutboxWorkflowEventPublisher` writes lifecycle events to `WorkflowOutboxMessage`; `WorkflowOutboxPublisher` atomically claims outbox rows, publishes them, retries failures, and clears leases on terminal outcomes.
+
+The SQL schema for this path is `src/Infrastructure/WorkflowPersistence/Sql/WorkflowTables.sql`. It is idempotent and should be applied before running SQL-backed workers. SQL Server integration tests are gated by `HEMI_TEST_SQLSERVER_CONNECTION_STRING`.
+
+Legacy saga code and `src/Infrastructure/Persistence/SagaCoreTables.sql` are migration/fallback-only. `GET /orders/{orderId}/fulfillment-saga` reads legacy saga state only when no durable workflow instance exists for the order.
+
+More detail: `docs/durable-workflow-orchestrator.md`.

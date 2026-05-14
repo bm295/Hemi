@@ -487,9 +487,9 @@ public sealed class WorkflowEngine : IWorkflowEngine
     {
         if (CanUseJournal(context))
         {
-            await AppendJournalAsync(
+            await AppendWorkflowStateTransitionAsync(
                 context,
-                new WorkflowJournalEntry(
+                new WorkflowStateTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
                     State: new WorkflowStateJournalEntry(
@@ -534,9 +534,9 @@ public sealed class WorkflowEngine : IWorkflowEngine
     {
         if (CanUseJournal(context))
         {
-            await AppendJournalAsync(
+            await AppendWorkflowStateTransitionAsync(
                 context,
-                new WorkflowJournalEntry(
+                new WorkflowStateTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
                     PayloadJson: SerializeContext(context),
@@ -583,9 +583,9 @@ public sealed class WorkflowEngine : IWorkflowEngine
         if (CanUseJournal(context))
         {
             var startedAtUtc = DateTimeOffset.UtcNow;
-            await AppendJournalAsync(
+            await AppendStepAttemptTransitionAsync(
                 context,
-                new WorkflowJournalEntry(
+                new WorkflowStepAttemptTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
                     Step: new WorkflowStepJournalEntry(
@@ -634,9 +634,9 @@ public sealed class WorkflowEngine : IWorkflowEngine
         if (CanUseJournal(context))
         {
             var completedAtUtc = DateTimeOffset.UtcNow;
-            await AppendJournalAsync(
+            await AppendStepAttemptTransitionAsync(
                 context,
-                new WorkflowJournalEntry(
+                new WorkflowStepAttemptTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
                     PayloadJson: SerializeContext(context),
@@ -691,9 +691,9 @@ public sealed class WorkflowEngine : IWorkflowEngine
         if (CanUseJournal(context))
         {
             var completedAtUtc = DateTimeOffset.UtcNow;
-            await AppendJournalAsync(
+            await AppendStepAttemptTransitionAsync(
                 context,
-                new WorkflowJournalEntry(
+                new WorkflowStepAttemptTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
                     PayloadJson: SerializeContext(context),
@@ -843,6 +843,30 @@ public sealed class WorkflowEngine : IWorkflowEngine
         CancellationToken cancellationToken)
     {
         var result = await _workflowJournal!.AppendAsync(
+            entry,
+            cancellationToken);
+
+        context.WorkflowInstanceVersion = result.WorkflowInstanceVersion;
+    }
+
+    private async Task AppendWorkflowStateTransitionAsync(
+        WorkflowContext context,
+        WorkflowStateTransitionJournalEntry entry,
+        CancellationToken cancellationToken)
+    {
+        var result = await _workflowJournal!.AppendWorkflowStateTransitionAsync(
+            entry,
+            cancellationToken);
+
+        context.WorkflowInstanceVersion = result.WorkflowInstanceVersion;
+    }
+
+    private async Task AppendStepAttemptTransitionAsync(
+        WorkflowContext context,
+        WorkflowStepAttemptTransitionJournalEntry entry,
+        CancellationToken cancellationToken)
+    {
+        var result = await _workflowJournal!.AppendStepAttemptTransitionAsync(
             entry,
             cancellationToken);
 
