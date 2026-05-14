@@ -104,18 +104,24 @@ public sealed class WorkflowWorkerServiceTests
         Assert.DoesNotContain("failed", outcomes);
     }
 
-    [Fact]
-    public async Task Worker_does_not_overwrite_terminal_dispatch_failure_with_pending()
+    [Theory]
+    [InlineData(WorkflowState.Succeeded)]
+    [InlineData(WorkflowState.Failed)]
+    [InlineData(WorkflowState.Compensated)]
+    [InlineData(WorkflowState.CompensationFailed)]
+    [InlineData(WorkflowState.Cancelled)]
+    public async Task Worker_does_not_change_terminal_dispatch_failures_to_pending(
+        WorkflowState terminalState)
     {
         var instance = CreateInstance(
             attempt: 1,
             version: 4,
-            payloadJson: """{"marker":"compensated"}""");
+            payloadJson: """{"marker":"terminal"}""");
         var store = new PollingWorkflowInstanceStore(instance);
         var dispatcher = new RecordingDispatcher(context =>
         {
-            context.State = WorkflowState.Compensated;
-            throw new InvalidOperationException("workflow already compensated");
+            context.State = terminalState;
+            throw new InvalidOperationException("workflow already terminal");
         });
 
         using var services = CreateServices(dispatcher);
@@ -129,9 +135,78 @@ public sealed class WorkflowWorkerServiceTests
         await worker.StopAsync(CancellationToken.None);
 
         Assert.Null(store.State);
+        Assert.DoesNotContain(WorkflowState.Pending, store.StateUpdates);
         Assert.Null(store.LastError);
         Assert.Null(store.CompletedAtUtc);
         Assert.Null(store.NextAttemptAtUtc);
+    }
+
+    [Fact]
+    public async Task Worker_dispatch_exceptions_after_compensation_do_not_schedule_retries()
+    {
+        var instance = CreateInstance(
+            attempt: 3,
+            version: 7,
+            payloadJson: """{"marker":"compensated"}""");
+        var store = new PollingWorkflowInstanceStore(instance);
+        var dispatcher = new RecordingDispatcher(context =>
+        {
+            context.State = WorkflowState.Compensated;
+            throw new InvalidOperationException("dispatch failed after compensation");
+        });
+
+        using var services = CreateServices(dispatcher);
+        using var worker = CreateWorker(
+            services,
+            store);
+
+        await worker.StartAsync(CancellationToken.None);
+
+        _ = await dispatcher.Handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await worker.StopAsync(CancellationToken.None);
+
+        Assert.Empty(store.StateUpdates);
+        Assert.Null(store.NextAttemptAtUtc);
+        Assert.DoesNotContain(
+            store.PayloadUpdateJsons,
+            payloadJson => payloadJson.Contains("dispatch failed after compensation", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Worker_expired_running_leases_resume_normally()
+    {
+        var expiredLeaseUntilUtc = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var instance = CreateInstance(
+            attempt: 5,
+            version: 9,
+            payloadJson: """{"marker":"expired-running-lease"}""",
+            leaseUntilUtc: expiredLeaseUntilUtc);
+        var store = new PollingWorkflowInstanceStore(instance);
+        var dispatcher = new RecordingDispatcher(context =>
+        {
+            Assert.Equal(WorkflowState.Running, context.State);
+            context.Set("resumed", true);
+            context.State = WorkflowState.Succeeded;
+            return Task.CompletedTask;
+        });
+
+        using var services = CreateServices(dispatcher);
+        using var worker = CreateWorker(
+            services,
+            store);
+
+        await worker.StartAsync(CancellationToken.None);
+
+        var context = await dispatcher.Handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await worker.StopAsync(CancellationToken.None);
+
+        Assert.Equal(WorkflowState.Running, store.ClaimedState);
+        Assert.Equal(expiredLeaseUntilUtc, store.ClaimedLeaseUntilUtc);
+        Assert.Equal(WorkflowState.Succeeded, context.State);
+        Assert.Equal(instance.Attempt, context.WorkflowAttempt);
+        Assert.Equal(instance.Version, context.WorkflowInstanceVersion);
+        Assert.Null(store.State);
+        Assert.DoesNotContain(@"""resumed"":true", store.PayloadJson, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -231,14 +306,16 @@ public sealed class WorkflowWorkerServiceTests
     private static WorkflowInstanceRecord CreateInstance(
         int attempt,
         int version,
-        string payloadJson) =>
+        string payloadJson,
+        WorkflowState state = WorkflowState.Running,
+        DateTimeOffset? leaseUntilUtc = null) =>
         new(
             Guid.NewGuid(),
             Guid.NewGuid(),
             "test-workflow",
             "test-workflow",
             Guid.NewGuid().ToString("D"),
-            WorkflowState.Running,
+            state,
             payloadJson,
             LastError: null,
             version,
@@ -251,7 +328,7 @@ public sealed class WorkflowWorkerServiceTests
             attempt,
             NextAttemptAtUtc: null,
             LeaseOwner: "worker-tests",
-            LeaseUntilUtc: DateTimeOffset.UtcNow.AddMinutes(5));
+            LeaseUntilUtc: leaseUntilUtc ?? DateTimeOffset.UtcNow.AddMinutes(5));
 
     private sealed class RecordingDispatcher(
         Func<WorkflowContext, Task> handle)
@@ -289,15 +366,23 @@ public sealed class WorkflowWorkerServiceTests
 
         public WorkflowState? State { get; private set; }
 
+        public List<WorkflowState> StateUpdates { get; } = [];
+
         public int? StateExpectedVersion { get; private set; }
 
         public string? PayloadJson { get; private set; } = instance.PayloadJson;
+
+        public List<string> PayloadUpdateJsons { get; } = [];
 
         public string? LastError { get; private set; }
 
         public DateTimeOffset? CompletedAtUtc { get; private set; }
 
         public DateTimeOffset? NextAttemptAtUtc { get; private set; }
+
+        public WorkflowState? ClaimedState { get; private set; }
+
+        public DateTimeOffset? ClaimedLeaseUntilUtc { get; private set; }
 
         public Task<WorkflowStartResult> StartWorkflowAsync(
             WorkflowStartRequest request,
@@ -332,6 +417,8 @@ public sealed class WorkflowWorkerServiceTests
             }
 
             _claimed = true;
+            ClaimedState = instance.State;
+            ClaimedLeaseUntilUtc = instance.LeaseUntilUtc;
             return Task.FromResult<IReadOnlyCollection<WorkflowInstanceRecord>>([instance]);
         }
 
@@ -345,6 +432,7 @@ public sealed class WorkflowWorkerServiceTests
             CancellationToken cancellationToken = default)
         {
             State = state;
+            StateUpdates.Add(state);
             StateExpectedVersion = expectedVersion;
             LastError = lastError;
             CompletedAtUtc = completedAtUtc;
@@ -360,6 +448,7 @@ public sealed class WorkflowWorkerServiceTests
             CancellationToken cancellationToken = default)
         {
             PayloadJson = payloadJson;
+            PayloadUpdateJsons.Add(payloadJson);
             return Task.FromResult(
                 id == instance.Id &&
                 expectedVersion == instance.Version);
