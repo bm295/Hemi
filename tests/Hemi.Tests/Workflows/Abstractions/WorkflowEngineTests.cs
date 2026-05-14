@@ -95,7 +95,7 @@ public sealed class WorkflowEngineTests
             logStore.Transitions);
         Assert.Equal(2, instanceStore.Payloads.Count);
         Assert.Contains(WorkflowState.Succeeded, instanceStore.States);
-        Assert.Equal(4, context.WorkflowInstanceVersion);
+        Assert.Equal(5, context.WorkflowInstanceVersion);
     }
 
     [Fact]
@@ -168,6 +168,11 @@ public sealed class WorkflowEngineTests
         Assert.Contains(
             journal.Entries,
             entry =>
+                entry.State?.State == WorkflowState.Running &&
+                entry.Event?.EventName == WorkflowEvents.WorkflowStarted);
+        Assert.Contains(
+            journal.Entries,
+            entry =>
                 entry.ExpectedLeaseOwner == "workflow-engine-test-worker" &&
                 entry.Step?.Action == WorkflowStepJournalAction.Running &&
                 entry.Event?.EventName == WorkflowEvents.StepStarted);
@@ -182,7 +187,7 @@ public sealed class WorkflowEngineTests
             entry =>
                 entry.State?.State == WorkflowState.Succeeded &&
                 entry.Event?.EventName == WorkflowEvents.WorkflowSucceeded);
-        Assert.Equal(3, context.WorkflowInstanceVersion);
+        Assert.Equal(4, context.WorkflowInstanceVersion);
     }
 
     [Fact]
@@ -212,6 +217,83 @@ public sealed class WorkflowEngineTests
             "Workflow journal writes require an active workflow lease owner.",
             exception.Message);
         Assert.Empty(journal.Entries);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_journals_compensated_steps_with_step_event()
+    {
+        var services = new ServiceCollection();
+        var recorder = new StepRecorder();
+        var journal = new RecordingWorkflowJournal();
+        services.AddSingleton(recorder);
+        services.AddSingleton<IWorkflowJournal>(journal);
+        services.AddTransient<CompensableStep>();
+        services.AddTransient<FailingStep>();
+
+        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var context = new WorkflowContext("test-workflow", "correlation-journal-compensation")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 1,
+            WorkflowAttempt = 1,
+            WorkflowLeaseOwner = "workflow-engine-test-worker",
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(CompensableStep),
+            typeof(FailingStep));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => engine.ExecuteAsync("test-workflow", definition, context));
+
+        Assert.Equal("Step failed.", exception.Message);
+        Assert.Contains(
+            journal.Entries,
+            entry =>
+                entry.PayloadJson is not null &&
+                entry.Step?.Action == WorkflowStepJournalAction.Compensated &&
+                entry.Event?.EventName == WorkflowEvents.StepCompensated);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_journals_compensation_failure_step_state_and_event_atomically()
+    {
+        var services = new ServiceCollection();
+        var recorder = new StepRecorder();
+        var journal = new RecordingWorkflowJournal();
+        services.AddSingleton(recorder);
+        services.AddSingleton<IWorkflowJournal>(journal);
+        services.AddTransient<FailingCompensationStep>();
+        services.AddTransient<FailingStep>();
+
+        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var context = new WorkflowContext(
+            "test-workflow",
+            "correlation-journal-compensation-failed")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 1,
+            WorkflowAttempt = 1,
+            WorkflowLeaseOwner = "workflow-engine-test-worker",
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FailingCompensationStep),
+            typeof(FailingStep));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => engine.ExecuteAsync("test-workflow", definition, context));
+
+        Assert.Equal("Compensation failed.", exception.Message);
+        Assert.Contains(
+            journal.Entries,
+            entry =>
+                entry.PayloadJson is not null &&
+                entry.Step?.Action == WorkflowStepJournalAction.CompensationFailed &&
+                entry.State?.State == WorkflowState.CompensationFailed &&
+                entry.Event?.EventName == WorkflowEvents.CompensationFailed);
     }
 
     [Fact]
@@ -418,7 +500,8 @@ public sealed class WorkflowEngineTests
         services.AddTransient<CompensableStep>();
         services.AddTransient<FailingStep>();
 
-        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var publisher = new RecordingWorkflowEventPublisher();
+        var engine = CreateEngine(services, publisher);
         var context = new WorkflowContext("test-workflow", "correlation-compensation")
         {
             WorkflowInstanceId = Guid.NewGuid(),
@@ -450,6 +533,9 @@ public sealed class WorkflowEngineTests
             update =>
                 update.State == WorkflowState.Compensated &&
                 update.NextAttemptAtUtc is null);
+        Assert.Contains(
+            publisher.Events,
+            workflowEvent => workflowEvent.EventName == WorkflowEvents.StepCompensated);
         Assert.True(instanceStore.Payloads.Count >= 2);
     }
 
@@ -913,13 +999,62 @@ public sealed class WorkflowEngineTests
         }
     }
 
+    private sealed record RecordedWorkflowJournalEntry(
+        Guid WorkflowInstanceId,
+        int ExpectedWorkflowVersion,
+        string ExpectedLeaseOwner,
+        string? PayloadJson = null,
+        WorkflowStateJournalEntry? State = null,
+        WorkflowStepJournalEntry? Step = null,
+        WorkflowEvent? Event = null);
+
     private sealed class RecordingWorkflowJournal : IWorkflowJournal
     {
-        public List<WorkflowJournalEntry> Entries { get; } = [];
+        public List<RecordedWorkflowJournalEntry> Entries { get; } = [];
 
-        public Task<WorkflowJournalResult> AppendAsync(
-            WorkflowJournalEntry entry,
+        public Task<WorkflowJournalResult> UpdateWorkflowPayloadAsync(
+            WorkflowPayloadJournalEntry entry,
             CancellationToken cancellationToken = default)
+        {
+            return Record(
+                new RecordedWorkflowJournalEntry(
+                    entry.WorkflowInstanceId,
+                    entry.ExpectedWorkflowVersion,
+                    entry.ExpectedLeaseOwner,
+                    PayloadJson: entry.PayloadJson));
+        }
+
+        public Task<WorkflowJournalResult> AppendWorkflowStateTransitionAsync(
+            WorkflowStateTransitionJournalEntry entry,
+            CancellationToken cancellationToken = default)
+        {
+            return Record(
+                new RecordedWorkflowJournalEntry(
+                    entry.WorkflowInstanceId,
+                    entry.ExpectedWorkflowVersion,
+                    entry.ExpectedLeaseOwner,
+                    PayloadJson: entry.PayloadJson,
+                    State: entry.State,
+                    Event: entry.Event));
+        }
+
+        public Task<WorkflowJournalResult> AppendStepAttemptTransitionAsync(
+            WorkflowStepAttemptTransitionJournalEntry entry,
+            CancellationToken cancellationToken = default)
+        {
+            return Record(
+                new RecordedWorkflowJournalEntry(
+                    entry.WorkflowInstanceId,
+                    entry.ExpectedWorkflowVersion,
+                    entry.ExpectedLeaseOwner,
+                    PayloadJson: entry.PayloadJson,
+                    State: entry.State,
+                    Step: entry.Step,
+                    Event: entry.Event));
+        }
+
+        private Task<WorkflowJournalResult> Record(
+            RecordedWorkflowJournalEntry entry)
         {
             Entries.Add(entry);
 

@@ -10,6 +10,8 @@ public static class WorkflowEvents
 
     public const string StepFailed = "workflow.step.failed";
 
+    public const string StepCompensated = "workflow.step.compensated";
+
     public const string CompensationStarted =
         "workflow.compensation.started";
 

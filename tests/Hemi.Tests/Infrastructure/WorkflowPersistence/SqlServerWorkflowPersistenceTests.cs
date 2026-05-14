@@ -700,7 +700,7 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.NotNull(persisted);
             Assert.Contains(@"""stepOne"":true", persisted.PayloadJson, StringComparison.Ordinal);
             Assert.Contains(@"""stepTwo"":true", persisted.PayloadJson, StringComparison.Ordinal);
-            Assert.Equal(4, persisted.Version);
+            Assert.Equal(5, persisted.Version);
         }
         finally
         {
@@ -745,16 +745,11 @@ public sealed class SqlServerWorkflowPersistenceTests
                     DateTimeOffset.UtcNow.AddSeconds(-1)));
 
             var completedAtUtc = DateTimeOffset.UtcNow;
-            _ = await journal.AppendAsync(
-                new WorkflowJournalEntry(
+            _ = await journal.AppendStepAttemptTransitionAsync(
+                new WorkflowStepAttemptTransitionJournalEntry(
                     instance.Id,
                     saved.Version,
                     "sql-journal-worker",
-                    PayloadJson: """{"source":"journal-test","completed":true}""",
-                    State: new WorkflowStateJournalEntry(
-                        WorkflowState.Succeeded,
-                        CompletedAtUtc: completedAtUtc,
-                        ClearLease: true),
                     Step: new WorkflowStepJournalEntry(
                         WorkflowStepJournalAction.Succeeded,
                         "CaptureOrderPaymentStep",
@@ -772,7 +767,12 @@ public sealed class SqlServerWorkflowPersistenceTests
                         completedAtUtc)
                     {
                         WorkflowInstanceId = instance.Id
-                    }));
+                    },
+                    PayloadJson: """{"source":"journal-test","completed":true}""",
+                    State: new WorkflowStateJournalEntry(
+                        WorkflowState.Succeeded,
+                        CompletedAtUtc: completedAtUtc,
+                        ClearLease: true)));
 
             var persisted = await instanceRepository.GetByIdAsync(instance.Id);
             Assert.NotNull(persisted);
@@ -837,14 +837,11 @@ public sealed class SqlServerWorkflowPersistenceTests
 
             var completedAtUtc = DateTimeOffset.UtcNow;
             _ = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                journal.AppendAsync(
-                    new WorkflowJournalEntry(
+                journal.AppendStepAttemptTransitionAsync(
+                    new WorkflowStepAttemptTransitionJournalEntry(
                         instance.Id,
                         saved.Version + 100,
                         "sql-journal-rollback-worker",
-                        State: new WorkflowStateJournalEntry(
-                            WorkflowState.Succeeded,
-                            CompletedAtUtc: completedAtUtc),
                         Step: new WorkflowStepJournalEntry(
                             WorkflowStepJournalAction.Succeeded,
                             "CaptureOrderPaymentStep",
@@ -862,7 +859,10 @@ public sealed class SqlServerWorkflowPersistenceTests
                             completedAtUtc)
                         {
                             WorkflowInstanceId = instance.Id
-                        })));
+                        },
+                        State: new WorkflowStateJournalEntry(
+                            WorkflowState.Succeeded,
+                            CompletedAtUtc: completedAtUtc))));
 
             var attempt = Assert.Single(
                 await logRepository.GetStepAttemptsAsync(instance.Id));
@@ -919,15 +919,11 @@ public sealed class SqlServerWorkflowPersistenceTests
 
             var completedAtUtc = DateTimeOffset.UtcNow;
             _ = await Assert.ThrowsAsync<InvalidOperationException>(() =>
-                journal.AppendAsync(
-                    new WorkflowJournalEntry(
+                journal.AppendStepAttemptTransitionAsync(
+                    new WorkflowStepAttemptTransitionJournalEntry(
                         instance.Id,
                         saved.Version,
                         "stale-worker",
-                        State: new WorkflowStateJournalEntry(
-                            WorkflowState.Succeeded,
-                            CompletedAtUtc: completedAtUtc,
-                            ClearLease: true),
                         Step: new WorkflowStepJournalEntry(
                             WorkflowStepJournalAction.Succeeded,
                             "CaptureOrderPaymentStep",
@@ -945,7 +941,11 @@ public sealed class SqlServerWorkflowPersistenceTests
                             completedAtUtc)
                         {
                             WorkflowInstanceId = instance.Id
-                        })));
+                        },
+                        State: new WorkflowStateJournalEntry(
+                            WorkflowState.Succeeded,
+                            CompletedAtUtc: completedAtUtc,
+                            ClearLease: true))));
 
             var attempt = Assert.Single(
                 await logRepository.GetStepAttemptsAsync(instance.Id));

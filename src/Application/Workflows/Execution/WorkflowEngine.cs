@@ -70,13 +70,15 @@ public sealed class WorkflowEngine : IWorkflowEngine
         {
             context.State = WorkflowState.Running;
 
-            await JournalEventAsync(
-                WorkflowEvents.WorkflowStarted,
+            await JournalWorkflowStateAsync(
+                context,
                 workflowId,
                 workflowDefinition,
-                context,
+                WorkflowState.Running,
+                WorkflowEvents.WorkflowStarted,
                 stepType: null,
                 error: null,
+                completedAtUtc: null,
                 executionToken);
 
             foreach (var indexedStep in EnumerateSteps(workflowDefinition))
@@ -310,6 +312,8 @@ public sealed class WorkflowEngine : IWorkflowEngine
 
                     await JournalStepCompensatedAsync(
                         context,
+                        workflowId,
+                        workflowDefinition,
                         compensationStep,
                         CancellationToken.None);
                 }
@@ -439,44 +443,6 @@ public sealed class WorkflowEngine : IWorkflowEngine
         }
 
         return compensationSteps;
-    }
-
-    private async Task JournalEventAsync(
-        string eventName,
-        string workflowId,
-        IWorkflowDefinition workflowDefinition,
-        WorkflowContext context,
-        Type? stepType,
-        Exception? error,
-        CancellationToken cancellationToken)
-    {
-        if (CanUseJournal(context))
-        {
-            await AppendJournalAsync(
-                context,
-                new WorkflowJournalEntry(
-                    context.WorkflowInstanceId!.Value,
-                    context.WorkflowInstanceVersion,
-                    GetRequiredWorkflowLeaseOwner(context),
-                    Event: CreateWorkflowEvent(
-                        eventName,
-                        workflowId,
-                        workflowDefinition,
-                        context,
-                        stepType,
-                        error)),
-                cancellationToken);
-            return;
-        }
-
-        await PublishAsync(
-            eventName,
-            workflowId,
-            workflowDefinition,
-            context,
-            stepType,
-            error,
-            cancellationToken);
     }
 
     private async Task JournalWorkflowStateAsync(
@@ -752,14 +718,17 @@ public sealed class WorkflowEngine : IWorkflowEngine
 
     private async Task JournalStepCompensatedAsync(
         WorkflowContext context,
+        string workflowId,
+        IWorkflowDefinition workflowDefinition,
         CompensationStep compensationStep,
         CancellationToken cancellationToken)
     {
         if (CanUseJournal(context))
         {
-            await AppendJournalAsync(
+            var compensatedAtUtc = DateTimeOffset.UtcNow;
+            await AppendStepAttemptTransitionAsync(
                 context,
-                new WorkflowJournalEntry(
+                new WorkflowStepAttemptTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
                     GetRequiredWorkflowLeaseOwner(context),
@@ -769,7 +738,15 @@ public sealed class WorkflowEngine : IWorkflowEngine
                         compensationStep.Step.GetType().Name,
                         compensationStep.Order,
                         compensationStep.Attempt,
-                        CompensatedAtUtc: DateTimeOffset.UtcNow)),
+                        CompensatedAtUtc: compensatedAtUtc),
+                    Event: CreateWorkflowEvent(
+                        WorkflowEvents.StepCompensated,
+                        workflowId,
+                        workflowDefinition,
+                        context,
+                        compensationStep.Step.GetType(),
+                        error: null,
+                        compensatedAtUtc)),
                 cancellationToken);
             return;
         }
@@ -781,6 +758,15 @@ public sealed class WorkflowEngine : IWorkflowEngine
         await MarkStepCompensatedAsync(
             context,
             compensationStep,
+            cancellationToken);
+
+        await PublishAsync(
+            WorkflowEvents.StepCompensated,
+            workflowId,
+            workflowDefinition,
+            context,
+            compensationStep.Step.GetType(),
+            error: null,
             cancellationToken);
     }
 
@@ -795,18 +781,13 @@ public sealed class WorkflowEngine : IWorkflowEngine
     {
         if (CanUseJournal(context))
         {
-            await AppendJournalAsync(
+            await AppendStepAttemptTransitionAsync(
                 context,
-                new WorkflowJournalEntry(
+                new WorkflowStepAttemptTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
                     GetRequiredWorkflowLeaseOwner(context),
                     PayloadJson: SerializeContext(context),
-                    State: new WorkflowStateJournalEntry(
-                        WorkflowState.CompensationFailed,
-                        error.Message,
-                        completedAtUtc,
-                        ClearLease: true),
                     Step: new WorkflowStepJournalEntry(
                         WorkflowStepJournalAction.CompensationFailed,
                         compensationStep.Step.GetType().Name,
@@ -821,7 +802,12 @@ public sealed class WorkflowEngine : IWorkflowEngine
                         context,
                         compensationStep.Step.GetType(),
                         error,
-                        completedAtUtc)),
+                        completedAtUtc),
+                    State: new WorkflowStateJournalEntry(
+                        WorkflowState.CompensationFailed,
+                        error.Message,
+                        completedAtUtc,
+                        ClearLease: true)),
                 cancellationToken);
             return;
         }
@@ -851,18 +837,6 @@ public sealed class WorkflowEngine : IWorkflowEngine
             compensationStep.Step.GetType(),
             error,
             cancellationToken);
-    }
-
-    private async Task AppendJournalAsync(
-        WorkflowContext context,
-        WorkflowJournalEntry entry,
-        CancellationToken cancellationToken)
-    {
-        var result = await _workflowJournal!.AppendAsync(
-            entry,
-            cancellationToken);
-
-        context.WorkflowInstanceVersion = result.WorkflowInstanceVersion;
     }
 
     private async Task AppendWorkflowStateTransitionAsync(

@@ -18,6 +18,15 @@ public sealed class SqlServerWorkflowJournal(
     private static readonly JsonSerializerOptions SerializerOptions =
         new(JsonSerializerDefaults.Web);
 
+    private sealed record WorkflowJournalAppend(
+        Guid WorkflowInstanceId,
+        int ExpectedWorkflowVersion,
+        string ExpectedLeaseOwner,
+        string? PayloadJson = null,
+        WorkflowStateJournalEntry? State = null,
+        WorkflowStepJournalEntry? Step = null,
+        WorkflowEvent? Event = null);
+
     public Task<WorkflowJournalResult> UpdateWorkflowPayloadAsync(
         WorkflowPayloadJournalEntry entry,
         CancellationToken cancellationToken = default)
@@ -25,7 +34,7 @@ public sealed class SqlServerWorkflowJournal(
         ArgumentNullException.ThrowIfNull(entry);
 
         return AppendCoreAsync(
-            new WorkflowJournalEntry(
+            new WorkflowJournalAppend(
                 entry.WorkflowInstanceId,
                 entry.ExpectedWorkflowVersion,
                 entry.ExpectedLeaseOwner,
@@ -42,7 +51,7 @@ public sealed class SqlServerWorkflowJournal(
         ArgumentNullException.ThrowIfNull(entry.Event);
 
         return AppendCoreAsync(
-            new WorkflowJournalEntry(
+            new WorkflowJournalAppend(
                 entry.WorkflowInstanceId,
                 entry.ExpectedWorkflowVersion,
                 entry.ExpectedLeaseOwner,
@@ -61,25 +70,19 @@ public sealed class SqlServerWorkflowJournal(
         ArgumentNullException.ThrowIfNull(entry.Event);
 
         return AppendCoreAsync(
-            new WorkflowJournalEntry(
+            new WorkflowJournalAppend(
                 entry.WorkflowInstanceId,
                 entry.ExpectedWorkflowVersion,
                 entry.ExpectedLeaseOwner,
                 PayloadJson: entry.PayloadJson,
+                State: entry.State,
                 Step: entry.Step,
                 Event: entry.Event),
             cancellationToken);
     }
 
-    public async Task<WorkflowJournalResult> AppendAsync(
-        WorkflowJournalEntry entry,
-        CancellationToken cancellationToken = default) =>
-        await AppendCoreAsync(
-            entry,
-            cancellationToken);
-
     private async Task<WorkflowJournalResult> AppendCoreAsync(
-        WorkflowJournalEntry entry,
+        WorkflowJournalAppend entry,
         CancellationToken cancellationToken = default)
     {
         Validate(entry);
@@ -498,7 +501,7 @@ public sealed class SqlServerWorkflowJournal(
         _ = await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static void Validate(WorkflowJournalEntry entry)
+    private static void Validate(WorkflowJournalAppend entry)
     {
         if (entry.WorkflowInstanceId == Guid.Empty)
         {
