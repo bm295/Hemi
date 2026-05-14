@@ -330,6 +330,119 @@ public sealed class OrderFulfillmentEndpointTests(
     }
 
     [Fact]
+    public async Task Get_workflow_instance_returns_latest_step_summaries_after_multiple_retry_attempts()
+    {
+        var client = factory.CreateClient();
+        var store = factory.WorkflowInstanceStore;
+        var logStore = factory.WorkflowExecutionLogStore;
+        var correlationId = Guid.NewGuid().ToString("D");
+
+        using var startResponse = await client.PostAsJsonAsync(
+            "/workflows/",
+            new StartWorkflowCommand(
+                WorkflowIds.OrderFulfillment,
+                correlationId,
+                new Dictionary<string, object?>
+                {
+                    ["marker"] = "retry-status"
+                },
+                $"workflow-test-{Guid.NewGuid():N}",
+                "endpoint-tests"));
+
+        Assert.Equal(HttpStatusCode.Accepted, startResponse.StatusCode);
+
+        var instance = await store.GetInstanceByCorrelationAsync(
+            WorkflowIds.OrderFulfillment,
+            correlationId);
+
+        Assert.NotNull(instance);
+        logStore.AddAttempt(new WorkflowStepAttemptRecord(
+            Guid.NewGuid(),
+            instance.Id,
+            "CaptureOrderPaymentStep",
+            StepOrder: 2,
+            WorkflowStepAttemptStatus.Failed,
+            Attempt: 1,
+            instance.CommandId,
+            ErrorMessage: "Payment gateway timeout.",
+            StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-9),
+            CompletedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-8),
+            CompensatedAtUtc: null));
+        logStore.AddAttempt(new WorkflowStepAttemptRecord(
+            Guid.NewGuid(),
+            instance.Id,
+            "CaptureOrderPaymentStep",
+            StepOrder: 2,
+            WorkflowStepAttemptStatus.Failed,
+            Attempt: 2,
+            instance.CommandId,
+            ErrorMessage: "Payment gateway retry timeout.",
+            StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-7),
+            CompletedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-6),
+            CompensatedAtUtc: null));
+        logStore.AddAttempt(new WorkflowStepAttemptRecord(
+            Guid.NewGuid(),
+            instance.Id,
+            "CaptureOrderPaymentStep",
+            StepOrder: 2,
+            WorkflowStepAttemptStatus.Succeeded,
+            Attempt: 3,
+            instance.CommandId,
+            ErrorMessage: null,
+            StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-5),
+            CompletedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-4),
+            CompensatedAtUtc: null));
+        logStore.AddAttempt(new WorkflowStepAttemptRecord(
+            Guid.NewGuid(),
+            instance.Id,
+            "DeductOrderInventoryStep",
+            StepOrder: 3,
+            WorkflowStepAttemptStatus.Failed,
+            Attempt: 1,
+            instance.CommandId,
+            ErrorMessage: "Inventory lock timeout.",
+            StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-3),
+            CompletedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-2),
+            CompensatedAtUtc: null));
+        logStore.AddAttempt(new WorkflowStepAttemptRecord(
+            Guid.NewGuid(),
+            instance.Id,
+            "DeductOrderInventoryStep",
+            StepOrder: 3,
+            WorkflowStepAttemptStatus.Running,
+            Attempt: 2,
+            instance.CommandId,
+            ErrorMessage: null,
+            StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-1),
+            CompletedAtUtc: null,
+            CompensatedAtUtc: null));
+
+        using var statusResponse = await client.GetAsync(
+            $"/workflows/{WorkflowIds.OrderFulfillment}/instances/{correlationId}");
+
+        Assert.Equal(HttpStatusCode.OK, statusResponse.StatusCode);
+
+        using var payload = await ReadJsonAsync(statusResponse);
+        var steps = payload.RootElement.GetProperty("steps")
+            .EnumerateArray()
+            .ToArray();
+
+        Assert.Equal(2, steps.Length);
+
+        Assert.Equal(2, steps[0].GetProperty("order").GetInt32());
+        Assert.Equal("CaptureOrderPaymentStep", steps[0].GetProperty("name").GetString());
+        Assert.Equal((int)WorkflowStepAttemptStatus.Succeeded, steps[0].GetProperty("status").GetInt32());
+        Assert.Equal(3, steps[0].GetProperty("attempt").GetInt32());
+        Assert.Equal(JsonValueKind.Null, steps[0].GetProperty("errorMessage").ValueKind);
+
+        Assert.Equal(3, steps[1].GetProperty("order").GetInt32());
+        Assert.Equal("DeductOrderInventoryStep", steps[1].GetProperty("name").GetString());
+        Assert.Equal((int)WorkflowStepAttemptStatus.Running, steps[1].GetProperty("status").GetInt32());
+        Assert.Equal(2, steps[1].GetProperty("attempt").GetInt32());
+        Assert.Equal(JsonValueKind.Null, steps[1].GetProperty("errorMessage").ValueKind);
+    }
+
+    [Fact]
     public async Task Get_fulfillment_saga_returns_durable_workflow_status_when_instance_exists()
     {
         var client = factory.CreateClient();
