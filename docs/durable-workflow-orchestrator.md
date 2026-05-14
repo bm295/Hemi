@@ -29,6 +29,20 @@ It falls back to `LegacyOrderFulfillmentSagaQueryService` only when no workflow
 instance exists for that order. That fallback is for migration and read
 compatibility with historical saga rows.
 
+## Current Implementation Boundary
+
+The workflow orchestration state is durable, but the current application host
+still uses in-memory restaurant adapters for orders, payments, inventory,
+tables, menu, and reservations. A workflow instance, step attempts, leases, and
+outbox events survive process restart through SQL Server; the restaurant side
+effects performed by workflow steps do not yet survive restart unless those
+ports are replaced by durable adapters.
+
+The outbox itself is SQL-backed. The final `IWorkflowMessagePublisher` binding
+is currently `InMemoryWorkflowMessagePublisher`, so event delivery is a local
+demo transport. A production deployment should replace that binding with a
+broker adapter while keeping the SQL outbox claim/publish flow.
+
 ## SQL Schema
 
 The durable workflow schema lives in
@@ -75,9 +89,15 @@ instances atomically with update locks, `READPAST`, and lease expiry:
 - expired leases can be reclaimed by another worker;
 - terminal state updates clear workflow leases.
 
-Workflow leases are fencing tokens, not only selection hints. A worker that no
-longer owns the row must not be able to complete a state transition or journal
-commit after another worker has reclaimed the workflow.
+Workflow leases are fencing tokens, not only selection hints. In the normal
+SQL-backed runtime, journaled state, payload, step, and event commits require
+the current lease owner. A worker that no longer owns the row cannot complete a
+journal commit after another worker has reclaimed the workflow.
+
+The direct `IWorkflowInstanceStore` state/payload mutation methods remain as a
+fallback path and are optimistic-versioned. Production workflow execution should
+prefer `IWorkflowJournal` so transition commits are both version- and
+lease-fenced.
 
 The outbox uses the same model. `WorkflowOutboxPublisher` claims pending
 messages with a lease owner and lease expiry, publishes only claimed messages,
@@ -113,6 +133,18 @@ the durable workflow path. Outbox messages include:
 The publisher claims eligible messages atomically, skips active leases, retries
 transient failures, and marks exhausted messages as failed only while it still
 owns the outbox lease.
+
+## Recoverable Worker Dispatch Failures
+
+Worker-level dispatch failures that happen before the engine reaches a terminal
+workflow state are retried. The default worker retry policy allows three
+dispatch attempts with a two-second delay. When the journal is available, the
+worker persists the updated payload, `Pending` state, `NextAttemptAtUtc`,
+cleared lease, and `workflow.retry_scheduled` event in one transition. After
+retry exhaustion, it journals terminal `Failed` state with `workflow.failed`.
+
+Terminal workflows and compensation terminal states are not reset to `Pending`
+and are not rescheduled.
 
 ## Legacy Saga Boundary
 

@@ -5,7 +5,7 @@ This repository now contains a layered C# application for **Hemi Steak & Seafood
 ## Restaurant scope
 
 - Venue: Hemi Steak & Seafood Grill
-- Capacity target: approximately **60–80 seats**
+- Capacity target: approximately **60-80 seats**
 
 ## Tech stack
 
@@ -14,7 +14,7 @@ This repository now contains a layered C# application for **Hemi Steak & Seafood
 - Layered architecture:
   - Presentation (Minimal API)
   - Application (use-case service + ports)
-  - Infrastructure (in-memory adapters)
+  - Infrastructure (in-memory FnB adapters + SQL workflow persistence)
   - Domain (entities and value objects)
 
 ## Features implemented
@@ -30,7 +30,7 @@ This repository now contains a layered C# application for **Hemi Steak & Seafood
   - deduct inventory on close
   - close order
 - Durable workflow-based order fulfillment endpoint (kitchen -> payment -> inventory -> close) with compensation on failure
-- SQL-backed workflow persistence for instances, step attempts, and workflow outbox messages
+- SQL-backed workflow persistence for instances, step attempts, journaled transitions, and workflow outbox messages
 - Idempotent workflow starts with correlation conflict protection
 - Worker and outbox lease recovery for safe polling across multiple processes
 - Reservation creation and upcoming reservation listing
@@ -69,13 +69,20 @@ The API starts locally and exposes endpoints such as:
 The active fulfillment runtime is the durable workflow orchestrator:
 
 - `POST /orders/{orderId}/fulfillment-saga` keeps the historical route name but enqueues the `order-fulfillment` workflow.
-- `WorkflowWorkerService` atomically claims due `WorkflowInstance` rows using SQL leases, dispatches the workflow, and lets expired leases be recovered by another worker. Workflow leases are fencing tokens: state, payload, and journal commits must match the current lease owner.
+- `WorkflowWorkerService` atomically claims due `WorkflowInstance` rows using SQL leases, dispatches the workflow, and lets expired leases be recovered by another worker. Workflow leases are fencing tokens for the journaled runtime: state, payload, step, and event commits must match the current lease owner.
 - `WorkflowEngine` records every step execution attempt, including internal retries, and persists compensation outcomes.
 - `SqlServerWorkflowJournal` persists state, payload, step attempt, and outbox event changes together for durable workflow transitions.
 - `OutboxWorkflowEventPublisher` writes lifecycle events to `WorkflowOutboxMessage`; `WorkflowOutboxPublisher` atomically claims outbox rows, publishes them, retries failures, and clears leases on terminal outcomes. Outbox leases are also fencing tokens, so stale publishers cannot complete messages after ownership changes.
+- Non-terminal worker dispatch failures are recoverable: the worker schedules retries with `workflow.retry_scheduled`, clears the workflow lease, and marks the workflow failed through the journal after dispatch retry exhaustion.
 
 The SQL schema for this path is `src/Infrastructure/WorkflowPersistence/Sql/WorkflowTables.sql`. It is idempotent and should be applied before running SQL-backed workers. SQL Server integration tests are gated by `HEMI_TEST_SQLSERVER_CONNECTION_STRING`.
 
 Legacy saga code and `src/Infrastructure/Persistence/SagaCoreTables.sql` are migration/fallback-only. `GET /orders/{orderId}/fulfillment-saga` reads legacy saga state only when no durable workflow instance exists for the order.
+
+Current durability boundary:
+
+- Workflow state, step attempts, workflow event outbox messages, worker leases, and outbox leases are SQL-backed.
+- Core restaurant ports for tables, menu, orders, payments, reservations, and inventory are still wired to in-memory adapters in the application host. Workflow state can recover after a restart, but order/payment/inventory side effects are not yet durable end to end.
+- `IWorkflowMessagePublisher` is currently bound to an in-memory publisher. The SQL outbox is durable, but final message delivery is a local/demo transport until a production broker adapter is supplied.
 
 More detail: `docs/durable-workflow-orchestrator.md`.
