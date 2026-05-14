@@ -137,6 +137,50 @@ public sealed class WorkflowEngineTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_routes_persistent_transitions_through_journal()
+    {
+        var services = new ServiceCollection();
+        var journal = new RecordingWorkflowJournal();
+        services.AddSingleton(new StepRecorder());
+        services.AddSingleton<IWorkflowJournal>(journal);
+        services.AddTransient<FirstStep>();
+
+        var publisher = new RecordingWorkflowEventPublisher();
+        var engine = CreateEngine(services, publisher);
+        var context = new WorkflowContext("test-workflow", "correlation-journal")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 1,
+            WorkflowAttempt = 1,
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FirstStep));
+
+        await engine.ExecuteAsync("test-workflow", definition, context);
+
+        Assert.Empty(publisher.Events);
+        Assert.Contains(
+            journal.Entries,
+            entry =>
+                entry.Step?.Action == WorkflowStepJournalAction.Running &&
+                entry.Event?.EventName == WorkflowEvents.StepStarted);
+        Assert.Contains(
+            journal.Entries,
+            entry =>
+                entry.PayloadJson is not null &&
+                entry.Step?.Action == WorkflowStepJournalAction.Succeeded &&
+                entry.Event?.EventName == WorkflowEvents.StepCompleted);
+        Assert.Contains(
+            journal.Entries,
+            entry =>
+                entry.State?.State == WorkflowState.Succeeded &&
+                entry.Event?.EventName == WorkflowEvents.WorkflowSucceeded);
+        Assert.Equal(3, context.WorkflowInstanceVersion);
+    }
+
+    [Fact]
     public async Task ExecuteAsync_records_failed_step_lifecycle_and_persists_workflow_failure()
     {
         var services = new ServiceCollection();
@@ -532,6 +576,31 @@ public sealed class WorkflowEngineTests
         {
             Transitions.Add($"compensation-failed:{stepOrder}:{attempt}");
             return Task.FromResult(true);
+        }
+    }
+
+    private sealed class RecordingWorkflowJournal : IWorkflowJournal
+    {
+        public List<WorkflowJournalEntry> Entries { get; } = [];
+
+        public Task<WorkflowJournalResult> AppendAsync(
+            WorkflowJournalEntry entry,
+            CancellationToken cancellationToken = default)
+        {
+            Entries.Add(entry);
+
+            var version = entry.ExpectedWorkflowVersion;
+            if (entry.PayloadJson is not null)
+            {
+                version++;
+            }
+
+            if (entry.State is not null)
+            {
+                version++;
+            }
+
+            return Task.FromResult(new WorkflowJournalResult(version));
         }
     }
 

@@ -647,6 +647,8 @@ public sealed class SqlServerWorkflowPersistenceTests
             var services = new ServiceCollection();
             services.AddSingleton<IWorkflowInstanceStore>(instanceRepository);
             services.AddSingleton<IWorkflowExecutionLogStore>(logRepository);
+            services.AddSingleton<IWorkflowJournal>(
+                new SqlServerWorkflowJournal(database.ConnectionString));
             services.AddTransient<SqlFirstPayloadStep>();
             services.AddTransient<SqlSecondPayloadStep>();
 
@@ -675,7 +677,171 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.NotNull(persisted);
             Assert.Contains(@"""stepOne"":true", persisted.PayloadJson, StringComparison.Ordinal);
             Assert.Contains(@"""stepTwo"":true", persisted.PayloadJson, StringComparison.Ordinal);
-            Assert.Equal(3, persisted.Version);
+            Assert.Equal(4, persisted.Version);
+        }
+        finally
+        {
+            await database.DeleteWorkflowInstanceAsync(instance.Id);
+        }
+    }
+
+    [SqlServerFact]
+    public async Task WorkflowJournal_commits_state_step_and_outbox_in_one_transaction()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var instanceRepository = new WorkflowInstanceRepository(database.ConnectionString);
+        var logRepository = new WorkflowExecutionLogRepository(database.ConnectionString);
+        var journal = new SqlServerWorkflowJournal(database.ConnectionString);
+        var instance = new WorkflowInstanceEntity
+        {
+            Id = Guid.NewGuid(),
+            CommandId = Guid.NewGuid(),
+            WorkflowId = WorkflowIds.OrderFulfillment,
+            WorkflowName = "Order Fulfillment",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = WorkflowState.Running,
+            PayloadJson = """{"source":"journal-test"}""",
+            Attempt = 1
+        };
+
+        try
+        {
+            await instanceRepository.SaveAsync(instance);
+            var saved = await instanceRepository.GetByIdAsync(instance.Id)
+                ?? throw new InvalidOperationException("Expected saved instance.");
+
+            _ = await logRepository.MarkStepRunningAsync(
+                new WorkflowStepAttemptStart(
+                    instance.Id,
+                    "CaptureOrderPaymentStep",
+                    StepOrder: 2,
+                    Attempt: 1,
+                    instance.CommandId,
+                    DateTimeOffset.UtcNow.AddSeconds(-1)));
+
+            var completedAtUtc = DateTimeOffset.UtcNow;
+            _ = await journal.AppendAsync(
+                new WorkflowJournalEntry(
+                    instance.Id,
+                    saved.Version,
+                    PayloadJson: """{"source":"journal-test","completed":true}""",
+                    State: new WorkflowStateJournalEntry(
+                        WorkflowState.Succeeded,
+                        CompletedAtUtc: completedAtUtc),
+                    Step: new WorkflowStepJournalEntry(
+                        WorkflowStepJournalAction.Succeeded,
+                        "CaptureOrderPaymentStep",
+                        StepOrder: 2,
+                        Attempt: 1,
+                        CompletedAtUtc: completedAtUtc),
+                    Event: new WorkflowEvent(
+                        WorkflowEvents.WorkflowSucceeded,
+                        instance.WorkflowId,
+                        instance.WorkflowName,
+                        instance.CorrelationId,
+                        WorkflowState.Succeeded,
+                        StepName: null,
+                        Error: null,
+                        completedAtUtc)
+                    {
+                        WorkflowInstanceId = instance.Id
+                    }));
+
+            var persisted = await instanceRepository.GetByIdAsync(instance.Id);
+            Assert.NotNull(persisted);
+            Assert.Equal(WorkflowState.Succeeded, persisted.State);
+            Assert.Contains(@"""completed"":true", persisted.PayloadJson, StringComparison.Ordinal);
+            Assert.Equal(saved.Version + 2, persisted.Version);
+            Assert.NotNull(persisted.CompletedAtUtc);
+
+            var attempt = Assert.Single(
+                await logRepository.GetStepAttemptsAsync(instance.Id));
+            Assert.Equal(WorkflowStepAttemptStatus.Succeeded, attempt.Status);
+            Assert.NotNull(attempt.CompletedAtUtc);
+
+            var message = Assert.Single(
+                await logRepository.GetMessagesForWorkflowAsync(instance.Id));
+            Assert.Equal(WorkflowEvents.WorkflowSucceeded, message.MessageType);
+            Assert.Equal(WorkflowOutboxStatus.Pending, message.Status);
+        }
+        finally
+        {
+            await database.DeleteWorkflowInstanceAsync(instance.Id);
+        }
+    }
+
+    [SqlServerFact]
+    public async Task WorkflowJournal_rolls_back_step_when_state_update_loses_concurrency()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var instanceRepository = new WorkflowInstanceRepository(database.ConnectionString);
+        var logRepository = new WorkflowExecutionLogRepository(database.ConnectionString);
+        var journal = new SqlServerWorkflowJournal(database.ConnectionString);
+        var instance = new WorkflowInstanceEntity
+        {
+            Id = Guid.NewGuid(),
+            CommandId = Guid.NewGuid(),
+            WorkflowId = WorkflowIds.OrderFulfillment,
+            WorkflowName = "Order Fulfillment",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = WorkflowState.Running,
+            PayloadJson = """{"source":"journal-rollback-test"}""",
+            Attempt = 1
+        };
+
+        try
+        {
+            await instanceRepository.SaveAsync(instance);
+            var saved = await instanceRepository.GetByIdAsync(instance.Id)
+                ?? throw new InvalidOperationException("Expected saved instance.");
+
+            _ = await logRepository.MarkStepRunningAsync(
+                new WorkflowStepAttemptStart(
+                    instance.Id,
+                    "CaptureOrderPaymentStep",
+                    StepOrder: 2,
+                    Attempt: 1,
+                    instance.CommandId,
+                    DateTimeOffset.UtcNow.AddSeconds(-1)));
+
+            var completedAtUtc = DateTimeOffset.UtcNow;
+            _ = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                journal.AppendAsync(
+                    new WorkflowJournalEntry(
+                        instance.Id,
+                        saved.Version + 100,
+                        State: new WorkflowStateJournalEntry(
+                            WorkflowState.Succeeded,
+                            CompletedAtUtc: completedAtUtc),
+                        Step: new WorkflowStepJournalEntry(
+                            WorkflowStepJournalAction.Succeeded,
+                            "CaptureOrderPaymentStep",
+                            StepOrder: 2,
+                            Attempt: 1,
+                            CompletedAtUtc: completedAtUtc),
+                        Event: new WorkflowEvent(
+                            WorkflowEvents.WorkflowSucceeded,
+                            instance.WorkflowId,
+                            instance.WorkflowName,
+                            instance.CorrelationId,
+                            WorkflowState.Succeeded,
+                            StepName: null,
+                            Error: null,
+                            completedAtUtc)
+                        {
+                            WorkflowInstanceId = instance.Id
+                        })));
+
+            var attempt = Assert.Single(
+                await logRepository.GetStepAttemptsAsync(instance.Id));
+            Assert.Equal(WorkflowStepAttemptStatus.Running, attempt.Status);
+
+            Assert.Empty(await logRepository.GetMessagesForWorkflowAsync(instance.Id));
+
+            var persisted = await instanceRepository.GetByIdAsync(instance.Id);
+            Assert.NotNull(persisted);
+            Assert.Equal(WorkflowState.Running, persisted.State);
+            Assert.Equal(saved.Version, persisted.Version);
         }
         finally
         {
@@ -1160,6 +1326,7 @@ public sealed class SqlServerWorkflowPersistenceTests
                 services.RemoveAll<WorkflowExecutionLogRepository>();
                 services.RemoveAll<IWorkflowExecutionLogStore>();
                 services.RemoveAll<IWorkflowOutboxStore>();
+                services.RemoveAll<IWorkflowJournal>();
 
                 services.AddSingleton(_ => new WorkflowInstanceRepository(connectionString));
                 services.AddSingleton<IWorkflowInstanceStore>(sp =>
@@ -1169,6 +1336,8 @@ public sealed class SqlServerWorkflowPersistenceTests
                     sp.GetRequiredService<WorkflowExecutionLogRepository>());
                 services.AddSingleton<IWorkflowOutboxStore>(sp =>
                     sp.GetRequiredService<WorkflowExecutionLogRepository>());
+                services.AddSingleton<IWorkflowJournal>(_ =>
+                    new SqlServerWorkflowJournal(connectionString));
             });
         }
     }

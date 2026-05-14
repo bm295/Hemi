@@ -12,6 +12,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
     private readonly IServiceProvider _serviceProvider;
     private readonly IRetryPolicyProvider _retryPolicyProvider;
     private readonly IWorkflowEventPublisher _workflowEventPublisher;
+    private readonly IWorkflowJournal? _workflowJournal;
     private readonly IWorkflowInstanceStore? _workflowInstanceStore;
     private readonly IWorkflowExecutionLogStore? _workflowExecutionLogStore;
 
@@ -24,6 +25,8 @@ public sealed class WorkflowEngine : IWorkflowEngine
         _retryPolicyProvider = retryPolicyProvider;
         _workflowEventPublisher =
             workflowEventPublisher ?? NoOpWorkflowEventPublisher.Instance;
+        _workflowJournal =
+            serviceProvider.GetService(typeof(IWorkflowJournal)) as IWorkflowJournal;
         _workflowInstanceStore =
             serviceProvider.GetService(typeof(IWorkflowInstanceStore)) as IWorkflowInstanceStore;
         _workflowExecutionLogStore =
@@ -67,7 +70,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
         {
             context.State = WorkflowState.Running;
 
-            await PublishAsync(
+            await JournalEventAsync(
                 WorkflowEvents.WorkflowStarted,
                 workflowId,
                 workflowDefinition,
@@ -88,19 +91,12 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 var step = ResolveStep(indexedStep.Type);
                 var stepAttempt = GetWorkflowAttempt(context);
 
-                await MarkStepRunningAsync(
+                await JournalStepRunningAsync(
                     context,
                     indexedStep,
                     stepAttempt,
-                    cancellationToken);
-
-                await PublishAsync(
-                    WorkflowEvents.StepStarted,
                     workflowId,
                     workflowDefinition,
-                    context,
-                    indexedStep.Type,
-                    error: null,
                     executionToken);
 
                 try
@@ -113,36 +109,24 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 }
                 catch (Exception ex)
                 {
-                    await MarkStepFailedAsync(
+                    await JournalStepFailedAsync(
                         context,
-                        indexedStep.Order,
-                        stepAttempt,
-                        ex,
-                        CancellationToken.None);
-
-                    await PersistContextAsync(
-                        context,
-                        CancellationToken.None);
-
-                    await PublishAsync(
-                        WorkflowEvents.StepFailed,
                         workflowId,
                         workflowDefinition,
-                        context,
-                        indexedStep.Type,
+                        indexedStep,
+                        indexedStep.Order,
+                        stepAttempt,
                         ex,
                         CancellationToken.None);
 
                     throw;
                 }
 
-                await PersistContextAsync(
+                await JournalStepSucceededAsync(
                     context,
-                    executionToken);
-
-                await MarkStepSucceededAsync(
-                    context,
-                    indexedStep.Order,
+                    workflowId,
+                    workflowDefinition,
+                    indexedStep,
                     stepAttempt,
                     executionToken);
 
@@ -155,33 +139,20 @@ public sealed class WorkflowEngine : IWorkflowEngine
                             compensableStep));
                 }
 
-                await PublishAsync(
-                    WorkflowEvents.StepCompleted,
-                    workflowId,
-                    workflowDefinition,
-                    context,
-                    indexedStep.Type,
-                    error: null,
-                    executionToken);
             }
 
             context.State = WorkflowState.Succeeded;
 
-            await PersistWorkflowStateAsync(
+            await JournalWorkflowStateAsync(
                 context,
+                workflowId,
+                workflowDefinition,
                 WorkflowState.Succeeded,
+                WorkflowEvents.WorkflowSucceeded,
+                stepType: null,
                 error: null,
                 completedAtUtc: DateTimeOffset.UtcNow,
                 CancellationToken.None);
-
-            await PublishAsync(
-                WorkflowEvents.WorkflowSucceeded,
-                workflowId,
-                workflowDefinition,
-                context,
-                stepType: null,
-                error: null,
-                executionToken);
         }
         catch (OperationCanceledException ex)
             when (timeoutCts.IsCancellationRequested &&
@@ -190,18 +161,12 @@ public sealed class WorkflowEngine : IWorkflowEngine
             context.LastError = ex;
             context.State = WorkflowState.Failed;
 
-            await PersistWorkflowFailureAsync(
+            await JournalWorkflowFailureAsync(
                 context,
-                ex,
-                CancellationToken.None);
-
-            await PublishAsync(
-                WorkflowEvents.WorkflowFailed,
                 workflowId,
                 workflowDefinition,
-                context,
-                stepType: null,
                 ex,
+                WorkflowEvents.WorkflowFailed,
                 CancellationToken.None);
 
             if (policies.EnableCompensation)
@@ -232,20 +197,14 @@ public sealed class WorkflowEngine : IWorkflowEngine
                     ? WorkflowState.Cancelled
                     : WorkflowState.Failed;
 
-            await PersistWorkflowFailureAsync(
+            await JournalWorkflowFailureAsync(
                 context,
+                workflowId,
+                workflowDefinition,
                 ex,
-                CancellationToken.None);
-
-            await PublishAsync(
                 context.State == WorkflowState.Cancelled
                     ? WorkflowEvents.WorkflowCancelled
                     : WorkflowEvents.WorkflowFailed,
-                workflowId,
-                workflowDefinition,
-                context,
-                stepType: null,
-                ex,
                 CancellationToken.None);
 
             if (policies.EnableCompensation &&
@@ -320,21 +279,16 @@ public sealed class WorkflowEngine : IWorkflowEngine
 
         try
         {
-            await PersistWorkflowStateAsync(
+            await JournalWorkflowStateAsync(
                 context,
+                workflowId,
+                workflowDefinition,
                 WorkflowState.Compensating,
+                WorkflowEvents.CompensationStarted,
+                stepType: null,
                 error: null,
                 completedAtUtc: null,
                 cancellationToken);
-
-            await PublishAsync(
-                WorkflowEvents.CompensationStarted,
-                workflowId,
-                workflowDefinition,
-                context,
-                stepType: null,
-                error: null,
-                CancellationToken.None);
 
             while (compensationSteps.Count > 0)
             {
@@ -346,11 +300,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
                         context,
                         cancellationToken);
 
-                    await PersistContextAsync(
-                        context,
-                        CancellationToken.None);
-
-                    await MarkStepCompensatedAsync(
+                    await JournalStepCompensatedAsync(
                         context,
                         compensationStep,
                         CancellationToken.None);
@@ -360,32 +310,15 @@ public sealed class WorkflowEngine : IWorkflowEngine
                     context.LastError = ex;
                     context.State = WorkflowState.CompensationFailed;
 
-                    await PersistContextAsync(
+                    await JournalStepCompensationFailedAsync(
                         context,
-                        CancellationToken.None);
-
-                    await MarkStepCompensationFailedAsync(
-                        context,
+                        workflowId,
+                        workflowDefinition,
                         compensationStep,
-                        ex,
-                        CancellationToken.None);
-
-                    await PersistWorkflowStateAsync(
-                        context,
-                        WorkflowState.CompensationFailed,
                         ex,
                         DateTimeOffset.UtcNow,
                         CancellationToken.None);
                     terminalStatePersisted = true;
-
-                    await PublishAsync(
-                        WorkflowEvents.CompensationFailed,
-                        workflowId,
-                        workflowDefinition,
-                        context,
-                        compensationStep.Step.GetType(),
-                        ex,
-                        CancellationToken.None);
 
                     throw;
                 }
@@ -393,22 +326,17 @@ public sealed class WorkflowEngine : IWorkflowEngine
 
             context.State = WorkflowState.Compensated;
 
-            await PersistWorkflowStateAsync(
+            await JournalWorkflowStateAsync(
                 context,
+                workflowId,
+                workflowDefinition,
                 WorkflowState.Compensated,
+                WorkflowEvents.CompensationCompleted,
+                stepType: null,
                 error: null,
                 completedAtUtc: DateTimeOffset.UtcNow,
                 CancellationToken.None);
             terminalStatePersisted = true;
-
-            await PublishAsync(
-                WorkflowEvents.CompensationCompleted,
-                workflowId,
-                workflowDefinition,
-                context,
-                stepType: null,
-                error: null,
-                CancellationToken.None);
         }
         catch (Exception ex)
         {
@@ -420,9 +348,13 @@ public sealed class WorkflowEngine : IWorkflowEngine
             context.LastError = ex;
             context.State = WorkflowState.CompensationFailed;
 
-            await PersistWorkflowStateAsync(
+            await JournalWorkflowStateAsync(
                 context,
+                workflowId,
+                workflowDefinition,
                 WorkflowState.CompensationFailed,
+                WorkflowEvents.CompensationFailed,
+                stepType: null,
                 ex,
                 DateTimeOffset.UtcNow,
                 CancellationToken.None);
@@ -500,6 +432,428 @@ public sealed class WorkflowEngine : IWorkflowEngine
 
         return compensationSteps;
     }
+
+    private async Task JournalEventAsync(
+        string eventName,
+        string workflowId,
+        IWorkflowDefinition workflowDefinition,
+        WorkflowContext context,
+        Type? stepType,
+        Exception? error,
+        CancellationToken cancellationToken)
+    {
+        if (CanUseJournal(context))
+        {
+            await AppendJournalAsync(
+                context,
+                new WorkflowJournalEntry(
+                    context.WorkflowInstanceId!.Value,
+                    context.WorkflowInstanceVersion,
+                    Event: CreateWorkflowEvent(
+                        eventName,
+                        workflowId,
+                        workflowDefinition,
+                        context,
+                        stepType,
+                        error)),
+                cancellationToken);
+            return;
+        }
+
+        await PublishAsync(
+            eventName,
+            workflowId,
+            workflowDefinition,
+            context,
+            stepType,
+            error,
+            cancellationToken);
+    }
+
+    private async Task JournalWorkflowStateAsync(
+        WorkflowContext context,
+        string workflowId,
+        IWorkflowDefinition workflowDefinition,
+        WorkflowState state,
+        string eventName,
+        Type? stepType,
+        Exception? error,
+        DateTimeOffset? completedAtUtc,
+        CancellationToken cancellationToken)
+    {
+        if (CanUseJournal(context))
+        {
+            await AppendJournalAsync(
+                context,
+                new WorkflowJournalEntry(
+                    context.WorkflowInstanceId!.Value,
+                    context.WorkflowInstanceVersion,
+                    State: new WorkflowStateJournalEntry(
+                        state,
+                        error?.Message,
+                        completedAtUtc),
+                    Event: CreateWorkflowEvent(
+                        eventName,
+                        workflowId,
+                        workflowDefinition,
+                        context,
+                        stepType,
+                        error)),
+                cancellationToken);
+            return;
+        }
+
+        await PersistWorkflowStateAsync(
+            context,
+            state,
+            error,
+            completedAtUtc,
+            cancellationToken);
+
+        await PublishAsync(
+            eventName,
+            workflowId,
+            workflowDefinition,
+            context,
+            stepType,
+            error,
+            cancellationToken);
+    }
+
+    private async Task JournalWorkflowFailureAsync(
+        WorkflowContext context,
+        string workflowId,
+        IWorkflowDefinition workflowDefinition,
+        Exception error,
+        string eventName,
+        CancellationToken cancellationToken)
+    {
+        if (CanUseJournal(context))
+        {
+            await AppendJournalAsync(
+                context,
+                new WorkflowJournalEntry(
+                    context.WorkflowInstanceId!.Value,
+                    context.WorkflowInstanceVersion,
+                    PayloadJson: SerializeContext(context),
+                    State: new WorkflowStateJournalEntry(
+                        context.State,
+                        error.Message,
+                        IsTerminal(context.State)
+                            ? DateTimeOffset.UtcNow
+                            : null),
+                    Event: CreateWorkflowEvent(
+                        eventName,
+                        workflowId,
+                        workflowDefinition,
+                        context,
+                        stepType: null,
+                        error)),
+                cancellationToken);
+            return;
+        }
+
+        await PersistWorkflowFailureAsync(
+            context,
+            error,
+            cancellationToken);
+
+        await PublishAsync(
+            eventName,
+            workflowId,
+            workflowDefinition,
+            context,
+            stepType: null,
+            error,
+            cancellationToken);
+    }
+
+    private async Task JournalStepRunningAsync(
+        WorkflowContext context,
+        IndexedStep indexedStep,
+        int attempt,
+        string workflowId,
+        IWorkflowDefinition workflowDefinition,
+        CancellationToken cancellationToken)
+    {
+        if (CanUseJournal(context))
+        {
+            var startedAtUtc = DateTimeOffset.UtcNow;
+            await AppendJournalAsync(
+                context,
+                new WorkflowJournalEntry(
+                    context.WorkflowInstanceId!.Value,
+                    context.WorkflowInstanceVersion,
+                    Step: new WorkflowStepJournalEntry(
+                        WorkflowStepJournalAction.Running,
+                        indexedStep.Type.Name,
+                        indexedStep.Order,
+                        attempt,
+                        context.CommandId,
+                        StartedAtUtc: startedAtUtc),
+                    Event: CreateWorkflowEvent(
+                        WorkflowEvents.StepStarted,
+                        workflowId,
+                        workflowDefinition,
+                        context,
+                        indexedStep.Type,
+                        error: null,
+                        startedAtUtc)),
+                cancellationToken);
+            return;
+        }
+
+        await MarkStepRunningAsync(
+            context,
+            indexedStep,
+            attempt,
+            cancellationToken);
+
+        await PublishAsync(
+            WorkflowEvents.StepStarted,
+            workflowId,
+            workflowDefinition,
+            context,
+            indexedStep.Type,
+            error: null,
+            cancellationToken);
+    }
+
+    private async Task JournalStepSucceededAsync(
+        WorkflowContext context,
+        string workflowId,
+        IWorkflowDefinition workflowDefinition,
+        IndexedStep indexedStep,
+        int attempt,
+        CancellationToken cancellationToken)
+    {
+        if (CanUseJournal(context))
+        {
+            var completedAtUtc = DateTimeOffset.UtcNow;
+            await AppendJournalAsync(
+                context,
+                new WorkflowJournalEntry(
+                    context.WorkflowInstanceId!.Value,
+                    context.WorkflowInstanceVersion,
+                    PayloadJson: SerializeContext(context),
+                    Step: new WorkflowStepJournalEntry(
+                        WorkflowStepJournalAction.Succeeded,
+                        indexedStep.Type.Name,
+                        indexedStep.Order,
+                        attempt,
+                        CompletedAtUtc: completedAtUtc),
+                    Event: CreateWorkflowEvent(
+                        WorkflowEvents.StepCompleted,
+                        workflowId,
+                        workflowDefinition,
+                        context,
+                        indexedStep.Type,
+                        error: null,
+                        completedAtUtc)),
+                cancellationToken);
+            return;
+        }
+
+        await PersistContextAsync(
+            context,
+            cancellationToken);
+
+        await MarkStepSucceededAsync(
+            context,
+            indexedStep.Order,
+            attempt,
+            cancellationToken);
+
+        await PublishAsync(
+            WorkflowEvents.StepCompleted,
+            workflowId,
+            workflowDefinition,
+            context,
+            indexedStep.Type,
+            error: null,
+            cancellationToken);
+    }
+
+    private async Task JournalStepFailedAsync(
+        WorkflowContext context,
+        string workflowId,
+        IWorkflowDefinition workflowDefinition,
+        IndexedStep indexedStep,
+        int stepOrder,
+        int attempt,
+        Exception error,
+        CancellationToken cancellationToken)
+    {
+        if (CanUseJournal(context))
+        {
+            var completedAtUtc = DateTimeOffset.UtcNow;
+            await AppendJournalAsync(
+                context,
+                new WorkflowJournalEntry(
+                    context.WorkflowInstanceId!.Value,
+                    context.WorkflowInstanceVersion,
+                    PayloadJson: SerializeContext(context),
+                    Step: new WorkflowStepJournalEntry(
+                        WorkflowStepJournalAction.Failed,
+                        indexedStep.Type.Name,
+                        stepOrder,
+                        attempt,
+                        ErrorMessage: error.Message,
+                        CompletedAtUtc: completedAtUtc),
+                    Event: CreateWorkflowEvent(
+                        WorkflowEvents.StepFailed,
+                        workflowId,
+                        workflowDefinition,
+                        context,
+                        indexedStep.Type,
+                        error,
+                        completedAtUtc)),
+                cancellationToken);
+            return;
+        }
+
+        await MarkStepFailedAsync(
+            context,
+            stepOrder,
+            attempt,
+            error,
+            cancellationToken);
+
+        await PersistContextAsync(
+            context,
+            cancellationToken);
+
+        await PublishAsync(
+            WorkflowEvents.StepFailed,
+            workflowId,
+            workflowDefinition,
+            context,
+            indexedStep.Type,
+            error,
+            cancellationToken);
+    }
+
+    private async Task JournalStepCompensatedAsync(
+        WorkflowContext context,
+        CompensationStep compensationStep,
+        CancellationToken cancellationToken)
+    {
+        if (CanUseJournal(context))
+        {
+            await AppendJournalAsync(
+                context,
+                new WorkflowJournalEntry(
+                    context.WorkflowInstanceId!.Value,
+                    context.WorkflowInstanceVersion,
+                    PayloadJson: SerializeContext(context),
+                    Step: new WorkflowStepJournalEntry(
+                        WorkflowStepJournalAction.Compensated,
+                        compensationStep.Step.GetType().Name,
+                        compensationStep.Order,
+                        compensationStep.Attempt,
+                        CompensatedAtUtc: DateTimeOffset.UtcNow)),
+                cancellationToken);
+            return;
+        }
+
+        await PersistContextAsync(
+            context,
+            cancellationToken);
+
+        await MarkStepCompensatedAsync(
+            context,
+            compensationStep,
+            cancellationToken);
+    }
+
+    private async Task JournalStepCompensationFailedAsync(
+        WorkflowContext context,
+        string workflowId,
+        IWorkflowDefinition workflowDefinition,
+        CompensationStep compensationStep,
+        Exception error,
+        DateTimeOffset completedAtUtc,
+        CancellationToken cancellationToken)
+    {
+        if (CanUseJournal(context))
+        {
+            await AppendJournalAsync(
+                context,
+                new WorkflowJournalEntry(
+                    context.WorkflowInstanceId!.Value,
+                    context.WorkflowInstanceVersion,
+                    PayloadJson: SerializeContext(context),
+                    State: new WorkflowStateJournalEntry(
+                        WorkflowState.CompensationFailed,
+                        error.Message,
+                        completedAtUtc),
+                    Step: new WorkflowStepJournalEntry(
+                        WorkflowStepJournalAction.CompensationFailed,
+                        compensationStep.Step.GetType().Name,
+                        compensationStep.Order,
+                        compensationStep.Attempt,
+                        ErrorMessage: error.Message,
+                        CompensatedAtUtc: completedAtUtc),
+                    Event: CreateWorkflowEvent(
+                        WorkflowEvents.CompensationFailed,
+                        workflowId,
+                        workflowDefinition,
+                        context,
+                        compensationStep.Step.GetType(),
+                        error,
+                        completedAtUtc)),
+                cancellationToken);
+            return;
+        }
+
+        await PersistContextAsync(
+            context,
+            cancellationToken);
+
+        await MarkStepCompensationFailedAsync(
+            context,
+            compensationStep,
+            error,
+            cancellationToken);
+
+        await PersistWorkflowStateAsync(
+            context,
+            WorkflowState.CompensationFailed,
+            error,
+            completedAtUtc,
+            cancellationToken);
+
+        await PublishAsync(
+            WorkflowEvents.CompensationFailed,
+            workflowId,
+            workflowDefinition,
+            context,
+            compensationStep.Step.GetType(),
+            error,
+            cancellationToken);
+    }
+
+    private async Task AppendJournalAsync(
+        WorkflowContext context,
+        WorkflowJournalEntry entry,
+        CancellationToken cancellationToken)
+    {
+        var result = await _workflowJournal!.AppendAsync(
+            entry,
+            cancellationToken);
+
+        context.WorkflowInstanceVersion = result.WorkflowInstanceVersion;
+    }
+
+    private bool CanUseJournal(WorkflowContext context) =>
+        _workflowJournal is not null &&
+        context.WorkflowInstanceId.HasValue &&
+        context.WorkflowInstanceVersion > 0;
+
+    private static string SerializeContext(WorkflowContext context) =>
+        JsonSerializer.Serialize(
+            context.Items,
+            SerializerOptions);
 
     private async Task PersistContextAsync(
         WorkflowContext context,
@@ -696,23 +1050,56 @@ public sealed class WorkflowEngine : IWorkflowEngine
         Exception? error,
         CancellationToken cancellationToken)
     {
-        var workflowEvent = new WorkflowEvent(
+        var workflowEvent = CreateWorkflowEvent(
             eventName,
             workflowId,
             workflowDefinition.Name,
-            context.CorrelationId,
-            context.State,
-            stepType?.Name,
-            error,
-            DateTimeOffset.UtcNow)
-        {
-            WorkflowInstanceId = context.WorkflowInstanceId
-        };
+            context,
+            stepType,
+            error);
 
         return _workflowEventPublisher.PublishAsync(
             workflowEvent,
             cancellationToken);
     }
+
+    private static WorkflowEvent CreateWorkflowEvent(
+        string eventName,
+        string workflowId,
+        IWorkflowDefinition workflowDefinition,
+        WorkflowContext context,
+        Type? stepType,
+        Exception? error,
+        DateTimeOffset? occurredAtUtc = null) =>
+        CreateWorkflowEvent(
+            eventName,
+            workflowId,
+            workflowDefinition.Name,
+            context,
+            stepType,
+            error,
+            occurredAtUtc);
+
+    private static WorkflowEvent CreateWorkflowEvent(
+        string eventName,
+        string workflowId,
+        string workflowName,
+        WorkflowContext context,
+        Type? stepType,
+        Exception? error,
+        DateTimeOffset? occurredAtUtc = null) =>
+        new(
+            eventName,
+            workflowId,
+            workflowName,
+            context.CorrelationId,
+            context.State,
+            stepType?.Name,
+            error,
+            occurredAtUtc ?? DateTimeOffset.UtcNow)
+        {
+            WorkflowInstanceId = context.WorkflowInstanceId
+        };
 
     private static Dictionary<int, WorkflowStepAttemptRecord> GetSucceededStepAttempts(
         IEnumerable<WorkflowStepAttemptRecord> attempts) =>

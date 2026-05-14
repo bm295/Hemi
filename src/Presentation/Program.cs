@@ -55,6 +55,10 @@ builder.Services.AddSingleton<IWorkflowExecutionLogStore>(sp =>
     sp.GetRequiredService<WorkflowExecutionLogRepository>());
 builder.Services.AddSingleton<IWorkflowOutboxStore>(sp =>
     sp.GetRequiredService<WorkflowExecutionLogRepository>());
+builder.Services.AddSingleton<IWorkflowJournal>(sp =>
+    new SqlServerWorkflowJournal(
+        connectionString,
+        sp.GetService<WorkflowMetrics>()));
 builder.Services.AddSingleton<WorkflowMetrics>();
 builder.Services.AddSingleton<WorkflowTracing>();
 
