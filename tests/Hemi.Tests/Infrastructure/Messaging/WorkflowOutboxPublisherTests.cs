@@ -100,6 +100,70 @@ public sealed class WorkflowOutboxPublisherTests
         Assert.Equal("transport unavailable", failed.ErrorMessage);
         Assert.NotNull(failed.NextAttemptAtUtc);
         Assert.True(failed.NextAttemptAtUtc > failed.LastAttemptAtUtc);
+
+        var storedMessage = Assert.Single(outboxStore.Messages);
+        Assert.Equal(WorkflowOutboxStatus.Pending, storedMessage.Status);
+        Assert.Equal(message.RetryCount + 1, storedMessage.RetryCount);
+        Assert.Equal("transport unavailable", storedMessage.ErrorMessage);
+        Assert.NotNull(storedMessage.LastAttemptAtUtc);
+        Assert.NotNull(storedMessage.NextAttemptAtUtc);
+        Assert.Null(storedMessage.LeaseOwner);
+        Assert.Null(storedMessage.LeaseUntilUtc);
+    }
+
+    [Fact]
+    public async Task PublishPendingAsync_two_publishers_cannot_claim_same_message_concurrently()
+    {
+        var message = CreateOutboxMessage();
+        var outboxStore = new RecordingWorkflowOutboxStore([message]);
+        var transport = new RecordingWorkflowMessagePublisher(async _ =>
+            await Task.Delay(TimeSpan.FromMilliseconds(50)));
+        var firstPublisher = new WorkflowOutboxPublisher(outboxStore, transport);
+        var secondPublisher = new WorkflowOutboxPublisher(outboxStore, transport);
+        var dueAtUtc = DateTimeOffset.UtcNow;
+
+        var publishedCounts = await Task.WhenAll(
+            firstPublisher.PublishPendingAsync(
+                batchSize: 10,
+                dueAtUtc: dueAtUtc),
+            secondPublisher.PublishPendingAsync(
+                batchSize: 10,
+                dueAtUtc: dueAtUtc));
+
+        Assert.Equal(1, publishedCounts.Sum());
+        Assert.Single(transport.PublishedMessages);
+        Assert.Equal(message.Id, Assert.Single(outboxStore.PublishedMessageIds));
+        Assert.Equal(2, outboxStore.Claims.Count);
+        Assert.Contains(outboxStore.Claims, claim => claim.ClaimedMessageIds.Contains(message.Id));
+        Assert.Contains(outboxStore.Claims, claim => claim.ClaimedMessageIds.Count == 0);
+    }
+
+    [Fact]
+    public async Task PublishPendingAsync_max_retry_exhaustion_marks_message_failed()
+    {
+        var message = CreateOutboxMessage(retryCount: 1);
+        var outboxStore = new RecordingWorkflowOutboxStore([message]);
+        var transport = new RecordingWorkflowMessagePublisher(
+            _ => throw new InvalidOperationException("transport unavailable"));
+        var publisher = new WorkflowOutboxPublisher(outboxStore, transport);
+
+        var publishedCount = await publisher.PublishPendingAsync(
+            batchSize: 10,
+            dueAtUtc: DateTimeOffset.UtcNow,
+            maxRetryAttempts: 2,
+            retryDelay: TimeSpan.FromMinutes(1));
+
+        Assert.Equal(0, publishedCount);
+        Assert.Empty(outboxStore.PublishedMessageIds);
+
+        var storedMessage = Assert.Single(outboxStore.Messages);
+        Assert.Equal(WorkflowOutboxStatus.Failed, storedMessage.Status);
+        Assert.Equal(2, storedMessage.RetryCount);
+        Assert.Equal("transport unavailable", storedMessage.ErrorMessage);
+        Assert.NotNull(storedMessage.LastAttemptAtUtc);
+        Assert.Null(storedMessage.NextAttemptAtUtc);
+        Assert.Null(storedMessage.LeaseOwner);
+        Assert.Null(storedMessage.LeaseUntilUtc);
     }
 
     private static WorkflowOutboxMessageRecord CreateOutboxMessage(
@@ -123,8 +187,9 @@ public sealed class WorkflowOutboxPublisherTests
         IReadOnlyCollection<WorkflowOutboxMessageRecord>? pendingMessages = null)
         : IWorkflowOutboxStore
     {
-        private readonly IReadOnlyCollection<WorkflowOutboxMessageRecord> _pendingMessages =
-            pendingMessages ?? [];
+        private readonly Lock _gate = new();
+        private readonly List<WorkflowOutboxMessageRecord> _messages =
+            pendingMessages?.ToList() ?? [];
 
         public List<WorkflowOutboxMessageDraft> SavedMessages { get; } = [];
 
@@ -134,12 +199,23 @@ public sealed class WorkflowOutboxPublisherTests
 
         public List<FailedOutboxMessage> FailedMessages { get; } = [];
 
+        public IReadOnlyCollection<WorkflowOutboxMessageRecord> Messages
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _messages.ToArray();
+                }
+            }
+        }
+
         public Task<WorkflowOutboxMessageRecord> SaveMessageAsync(
             WorkflowOutboxMessageDraft message,
             CancellationToken cancellationToken = default)
         {
             SavedMessages.Add(message);
-            return Task.FromResult(new WorkflowOutboxMessageRecord(
+            var record = new WorkflowOutboxMessageRecord(
                 Guid.NewGuid(),
                 message.WorkflowInstanceId,
                 message.MessageType,
@@ -152,7 +228,14 @@ public sealed class WorkflowOutboxPublisherTests
                 message.CreatedAtUtc ?? DateTimeOffset.UtcNow,
                 LastAttemptAtUtc: null,
                 message.NextAttemptAtUtc,
-                PublishedAtUtc: null));
+                PublishedAtUtc: null);
+
+            lock (_gate)
+            {
+                _messages.Add(record);
+            }
+
+            return Task.FromResult(record);
         }
 
         public Task<IReadOnlyCollection<WorkflowOutboxMessageRecord>> GetMessagesForWorkflowAsync(
@@ -175,13 +258,43 @@ public sealed class WorkflowOutboxPublisherTests
             TimeSpan leaseDuration,
             int batchSize)
         {
-            Claims.Add(new ClaimedOutboxMessages(
-                nowUtc,
-                leaseOwner,
-                leaseDuration,
-                batchSize));
+            lock (_gate)
+            {
+                var claimedMessages = _messages
+                    .Where(message =>
+                        message.Status == WorkflowOutboxStatus.Pending &&
+                        (message.NextAttemptAtUtc is null ||
+                            message.NextAttemptAtUtc <= nowUtc) &&
+                        (message.LeaseUntilUtc is null ||
+                            message.LeaseUntilUtc <= nowUtc))
+                    .OrderBy(message => message.CreatedAtUtc)
+                    .Take(batchSize)
+                    .ToArray();
 
-            return _pendingMessages.Take(batchSize).ToArray();
+                foreach (var message in claimedMessages)
+                {
+                    UpdateMessage(message.Id, existing => existing with
+                    {
+                        LeaseOwner = leaseOwner,
+                        LeaseUntilUtc = nowUtc.Add(leaseDuration)
+                    });
+                }
+
+                Claims.Add(new ClaimedOutboxMessages(
+                    nowUtc,
+                    leaseOwner,
+                    leaseDuration,
+                    batchSize,
+                    claimedMessages.Select(message => message.Id).ToArray()));
+
+                return claimedMessages
+                    .Select(message => message with
+                    {
+                        LeaseOwner = leaseOwner,
+                        LeaseUntilUtc = nowUtc.Add(leaseDuration)
+                    })
+                    .ToArray();
+            }
         }
 
         public Task MarkMessagePublishedAsync(
@@ -189,7 +302,21 @@ public sealed class WorkflowOutboxPublisherTests
             DateTimeOffset publishedAtUtc,
             CancellationToken cancellationToken = default)
         {
-            PublishedMessageIds.Add(messageId);
+            lock (_gate)
+            {
+                PublishedMessageIds.Add(messageId);
+                UpdateMessage(messageId, message => message with
+                {
+                    Status = WorkflowOutboxStatus.Published,
+                    ErrorMessage = null,
+                    LastAttemptAtUtc = publishedAtUtc,
+                    NextAttemptAtUtc = null,
+                    PublishedAtUtc = publishedAtUtc,
+                    LeaseOwner = null,
+                    LeaseUntilUtc = null
+                });
+            }
+
             return Task.CompletedTask;
         }
 
@@ -200,13 +327,40 @@ public sealed class WorkflowOutboxPublisherTests
             DateTimeOffset? nextAttemptAtUtc,
             CancellationToken cancellationToken = default)
         {
-            FailedMessages.Add(new FailedOutboxMessage(
-                messageId,
-                errorMessage,
-                lastAttemptAtUtc,
-                nextAttemptAtUtc));
+            lock (_gate)
+            {
+                FailedMessages.Add(new FailedOutboxMessage(
+                    messageId,
+                    errorMessage,
+                    lastAttemptAtUtc,
+                    nextAttemptAtUtc));
+
+                UpdateMessage(messageId, message => message with
+                {
+                    Status = nextAttemptAtUtc.HasValue
+                        ? WorkflowOutboxStatus.Pending
+                        : WorkflowOutboxStatus.Failed,
+                    RetryCount = message.RetryCount + 1,
+                    ErrorMessage = errorMessage,
+                    LastAttemptAtUtc = lastAttemptAtUtc,
+                    NextAttemptAtUtc = nextAttemptAtUtc,
+                    LeaseOwner = null,
+                    LeaseUntilUtc = null
+                });
+            }
 
             return Task.CompletedTask;
+        }
+
+        private void UpdateMessage(
+            Guid messageId,
+            Func<WorkflowOutboxMessageRecord, WorkflowOutboxMessageRecord> update)
+        {
+            var index = _messages.FindIndex(message => message.Id == messageId);
+            if (index >= 0)
+            {
+                _messages[index] = update(_messages[index]);
+            }
         }
     }
 
@@ -214,6 +368,7 @@ public sealed class WorkflowOutboxPublisherTests
         Func<WorkflowMessageEnvelope, Task>? publish = null)
         : IWorkflowMessagePublisher
     {
+        private readonly Lock _gate = new();
         private readonly Func<WorkflowMessageEnvelope, Task> _publish =
             publish ?? (_ => Task.CompletedTask);
 
@@ -224,7 +379,10 @@ public sealed class WorkflowOutboxPublisherTests
             CancellationToken cancellationToken = default)
         {
             await _publish(message);
-            PublishedMessages.Add(message);
+            lock (_gate)
+            {
+                PublishedMessages.Add(message);
+            }
         }
     }
 
@@ -238,5 +396,6 @@ public sealed class WorkflowOutboxPublisherTests
         DateTimeOffset NowUtc,
         string LeaseOwner,
         TimeSpan LeaseDuration,
-        int BatchSize);
+        int BatchSize,
+        IReadOnlyCollection<Guid> ClaimedMessageIds);
 }
