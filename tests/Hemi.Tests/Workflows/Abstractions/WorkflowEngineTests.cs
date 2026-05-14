@@ -99,10 +99,12 @@ public sealed class WorkflowEngineTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_persists_success_before_publishing_succeeded_event()
+    public async Task ExecuteAsync_persists_terminal_success_state_before_terminal_event_is_enqueued()
     {
         var services = new ServiceCollection();
-        var instanceStore = new RecordingWorkflowInstanceStore();
+        var operations = new List<string>();
+        var instanceStore = new RecordingWorkflowInstanceStore(
+            state => operations.Add($"state:{state}"));
         var logStore = new RecordingWorkflowExecutionLogStore();
         services.AddSingleton(new StepRecorder());
         services.AddSingleton<IWorkflowInstanceStore>(instanceStore);
@@ -111,10 +113,7 @@ public sealed class WorkflowEngineTests
 
         var publisher = new RecordingWorkflowEventPublisher(workflowEvent =>
         {
-            if (workflowEvent.EventName == WorkflowEvents.WorkflowSucceeded)
-            {
-                Assert.Contains(WorkflowState.Succeeded, instanceStore.States);
-            }
+            operations.Add($"event:{workflowEvent.EventName}");
         });
         var engine = CreateEngine(services, publisher);
         var context = new WorkflowContext("test-workflow", "correlation-success")
@@ -134,6 +133,9 @@ public sealed class WorkflowEngineTests
         Assert.Contains(
             publisher.Events,
             workflowEvent => workflowEvent.EventName == WorkflowEvents.WorkflowSucceeded);
+        Assert.True(
+            operations.IndexOf("state:Succeeded") <
+            operations.IndexOf($"event:{WorkflowEvents.WorkflowSucceeded}"));
     }
 
     [Fact]
@@ -212,7 +214,7 @@ public sealed class WorkflowEngineTests
     }
 
     [Fact]
-    public async Task ExecuteAsync_records_each_internal_step_retry_as_separate_attempt()
+    public async Task ExecuteAsync_failed_step_retries_create_multiple_step_attempt_rows()
     {
         var services = new ServiceCollection();
         var recorder = new StepRecorder();
@@ -250,19 +252,35 @@ public sealed class WorkflowEngineTests
         Assert.Equal(
             ["running:1:1", "failed:1:1", "running:1:2", "succeeded:1:2"],
             logStore.Transitions);
+        var attempts = await logStore.GetStepAttemptsAsync(context.WorkflowInstanceId.Value);
+        Assert.Collection(
+            attempts.OrderBy(attempt => attempt.Attempt),
+            attempt =>
+            {
+                Assert.Equal(1, attempt.Attempt);
+                Assert.Equal(WorkflowStepAttemptStatus.Failed, attempt.Status);
+                Assert.NotNull(attempt.CompletedAtUtc);
+            },
+            attempt =>
+            {
+                Assert.Equal(2, attempt.Attempt);
+                Assert.Equal(WorkflowStepAttemptStatus.Succeeded, attempt.Status);
+                Assert.NotNull(attempt.CompletedAtUtc);
+            });
         Assert.Equal(WorkflowState.Succeeded, context.State);
     }
 
     [Fact]
-    public async Task ExecuteAsync_resumes_by_skipping_persisted_succeeded_steps()
+    public async Task ExecuteAsync_resumed_workflows_skip_succeeded_steps_and_continue_from_durable_logs()
     {
         var services = new ServiceCollection();
         var recorder = new StepRecorder();
+        var workflowInstanceId = Guid.Parse("22222222-2222-2222-2222-222222222222");
         var logStore = new RecordingWorkflowExecutionLogStore(
         [
             new WorkflowStepAttemptRecord(
                 Guid.NewGuid(),
-                WorkflowInstanceId: Guid.Parse("22222222-2222-2222-2222-222222222222"),
+                workflowInstanceId,
                 StepName: nameof(FirstStep),
                 StepOrder: 1,
                 WorkflowStepAttemptStatus.Succeeded,
@@ -281,7 +299,7 @@ public sealed class WorkflowEngineTests
         var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
         var context = new WorkflowContext("test-workflow", "correlation-resume")
         {
-            WorkflowInstanceId = Guid.Parse("22222222-2222-2222-2222-222222222222"),
+            WorkflowInstanceId = workflowInstanceId,
             WorkflowInstanceVersion = 2,
             WorkflowAttempt = 2,
             CommandId = Guid.NewGuid()
@@ -295,6 +313,17 @@ public sealed class WorkflowEngineTests
 
         Assert.Equal(["second"], recorder.Executed);
         Assert.Equal(["running:2:1", "succeeded:2:1"], logStore.Transitions);
+        var attempts = await logStore.GetStepAttemptsAsync(workflowInstanceId);
+        Assert.Contains(
+            attempts,
+            attempt =>
+                attempt.StepOrder == 1 &&
+                attempt.Status == WorkflowStepAttemptStatus.Succeeded);
+        Assert.Contains(
+            attempts,
+            attempt =>
+                attempt.StepOrder == 2 &&
+                attempt.Status == WorkflowStepAttemptStatus.Succeeded);
         Assert.Equal(WorkflowState.Succeeded, context.State);
     }
 
@@ -384,7 +413,56 @@ public sealed class WorkflowEngineTests
         Assert.Contains(WorkflowState.Failed, instanceStore.States);
         Assert.Contains(WorkflowState.Compensating, instanceStore.States);
         Assert.Contains(WorkflowState.Compensated, instanceStore.States);
+        Assert.Contains(
+            instanceStore.StateUpdates,
+            update =>
+                update.State == WorkflowState.Compensated &&
+                update.NextAttemptAtUtc is null);
         Assert.True(instanceStore.Payloads.Count >= 2);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_compensation_terminal_states_are_never_rescheduled()
+    {
+        var services = new ServiceCollection();
+        var recorder = new StepRecorder();
+        var instanceStore = new RecordingWorkflowInstanceStore();
+        var logStore = new RecordingWorkflowExecutionLogStore();
+        services.AddSingleton(recorder);
+        services.AddSingleton<IWorkflowInstanceStore>(instanceStore);
+        services.AddSingleton<IWorkflowExecutionLogStore>(logStore);
+        services.AddTransient<FailingCompensationStep>();
+        services.AddTransient<FailingStep>();
+
+        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var context = new WorkflowContext("test-workflow", "correlation-compensation-terminal")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 1,
+            WorkflowAttempt = 1,
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FailingCompensationStep),
+            typeof(FailingStep));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => engine.ExecuteAsync("test-workflow", definition, context));
+
+        Assert.Equal("Compensation failed.", exception.Message);
+        Assert.Equal(WorkflowState.CompensationFailed, context.State);
+        Assert.Contains(
+            instanceStore.StateUpdates,
+            update =>
+                update.State == WorkflowState.CompensationFailed &&
+                update.NextAttemptAtUtc is null);
+        Assert.DoesNotContain(
+            instanceStore.StateUpdates,
+            update =>
+                (update.State is WorkflowState.Compensated
+                    or WorkflowState.CompensationFailed) &&
+                update.NextAttemptAtUtc is not null);
     }
 
     [Fact]
@@ -529,6 +607,26 @@ public sealed class WorkflowEngineTests
         }
     }
 
+    private sealed class FailingCompensationStep(StepRecorder recorder)
+        : ICompensableWorkflowStep<WorkflowContext>
+    {
+        public Task ExecuteAsync(
+            WorkflowContext context,
+            CancellationToken cancellationToken = default)
+        {
+            recorder.Executed.Add("failing-compensation-source");
+            return Task.CompletedTask;
+        }
+
+        public Task CompensateAsync(
+            WorkflowContext context,
+            CancellationToken cancellationToken = default)
+        {
+            recorder.Executed.Add("failing-compensation");
+            throw new InvalidOperationException("Compensation failed.");
+        }
+    }
+
     private sealed class FailingStep
         : IWorkflowStep<WorkflowContext>
     {
@@ -538,12 +636,21 @@ public sealed class WorkflowEngineTests
             throw new InvalidOperationException("Step failed.");
     }
 
-    private sealed class RecordingWorkflowInstanceStore
+    private sealed record StateUpdate(
+        WorkflowState State,
+        int ExpectedVersion,
+        DateTimeOffset? CompletedAtUtc,
+        DateTimeOffset? NextAttemptAtUtc);
+
+    private sealed class RecordingWorkflowInstanceStore(
+        Action<WorkflowState>? onStateUpdate = null)
         : IWorkflowInstanceStore
     {
         public List<string> Payloads { get; } = [];
 
         public List<WorkflowState> States { get; } = [];
+
+        public List<StateUpdate> StateUpdates { get; } = [];
 
         public Task<WorkflowStartResult> StartWorkflowAsync(
             WorkflowStartRequest request,
@@ -579,6 +686,12 @@ public sealed class WorkflowEngineTests
             CancellationToken cancellationToken = default)
         {
             States.Add(state);
+            StateUpdates.Add(new StateUpdate(
+                state,
+                expectedVersion,
+                completedAtUtc,
+                nextAttemptAtUtc));
+            onStateUpdate?.Invoke(state);
             return Task.FromResult(true);
         }
 
@@ -603,7 +716,7 @@ public sealed class WorkflowEngineTests
     private sealed class RecordingWorkflowExecutionLogStore
         : IWorkflowExecutionLogStore
     {
-        private readonly IReadOnlyCollection<WorkflowStepAttemptRecord> _attempts;
+        private readonly List<WorkflowStepAttemptRecord> _attempts;
 
         public RecordingWorkflowExecutionLogStore()
             : this([])
@@ -613,7 +726,7 @@ public sealed class WorkflowEngineTests
         public RecordingWorkflowExecutionLogStore(
             IReadOnlyCollection<WorkflowStepAttemptRecord> attempts)
         {
-            _attempts = attempts;
+            _attempts = [.. attempts];
         }
 
         public List<string> Transitions { get; } = [];
@@ -621,14 +734,21 @@ public sealed class WorkflowEngineTests
         public Task<IReadOnlyCollection<WorkflowStepAttemptRecord>> GetStepAttemptsAsync(
             Guid workflowInstanceId,
             CancellationToken cancellationToken = default) =>
-            Task.FromResult(_attempts);
+            Task.FromResult<IReadOnlyCollection<WorkflowStepAttemptRecord>>(
+                _attempts
+                    .Where(attempt => attempt.WorkflowInstanceId == workflowInstanceId)
+                    .ToArray());
 
         public Task<WorkflowStepAttemptRecord> MarkStepRunningAsync(
             WorkflowStepAttemptStart request,
             CancellationToken cancellationToken = default)
         {
             Transitions.Add($"running:{request.StepOrder}:{request.Attempt}");
-            return Task.FromResult(new WorkflowStepAttemptRecord(
+            var existingIndex = _attempts.FindIndex(attempt =>
+                attempt.WorkflowInstanceId == request.WorkflowInstanceId &&
+                attempt.StepOrder == request.StepOrder &&
+                attempt.Attempt == request.Attempt);
+            var attempt = new WorkflowStepAttemptRecord(
                 Guid.NewGuid(),
                 request.WorkflowInstanceId,
                 request.StepName,
@@ -639,7 +759,18 @@ public sealed class WorkflowEngineTests
                 ErrorMessage: null,
                 request.StartedAtUtc,
                 CompletedAtUtc: null,
-                CompensatedAtUtc: null));
+                CompensatedAtUtc: null);
+
+            if (existingIndex >= 0)
+            {
+                _attempts[existingIndex] = attempt;
+            }
+            else
+            {
+                _attempts.Add(attempt);
+            }
+
+            return Task.FromResult(attempt);
         }
 
         public Task<bool> MarkStepSucceededAsync(
@@ -650,6 +781,14 @@ public sealed class WorkflowEngineTests
             CancellationToken cancellationToken = default)
         {
             Transitions.Add($"succeeded:{stepOrder}:{attempt}");
+            MarkTerminal(
+                workflowInstanceId,
+                stepOrder,
+                attempt,
+                WorkflowStepAttemptStatus.Succeeded,
+                errorMessage: null,
+                completedAtUtc,
+                compensatedAtUtc: null);
             return Task.FromResult(true);
         }
 
@@ -662,6 +801,14 @@ public sealed class WorkflowEngineTests
             CancellationToken cancellationToken = default)
         {
             Transitions.Add($"failed:{stepOrder}:{attempt}");
+            MarkTerminal(
+                workflowInstanceId,
+                stepOrder,
+                attempt,
+                WorkflowStepAttemptStatus.Failed,
+                errorMessage,
+                completedAtUtc,
+                compensatedAtUtc: null);
             return Task.FromResult(true);
         }
 
@@ -673,6 +820,14 @@ public sealed class WorkflowEngineTests
             CancellationToken cancellationToken = default)
         {
             Transitions.Add($"compensated:{stepOrder}:{attempt}");
+            MarkTerminal(
+                workflowInstanceId,
+                stepOrder,
+                attempt,
+                WorkflowStepAttemptStatus.Compensated,
+                errorMessage: null,
+                completedAtUtc: null,
+                compensatedAtUtc);
             return Task.FromResult(true);
         }
 
@@ -685,7 +840,44 @@ public sealed class WorkflowEngineTests
             CancellationToken cancellationToken = default)
         {
             Transitions.Add($"compensation-failed:{stepOrder}:{attempt}");
+            MarkTerminal(
+                workflowInstanceId,
+                stepOrder,
+                attempt,
+                WorkflowStepAttemptStatus.CompensationFailed,
+                errorMessage,
+                completedAtUtc: null,
+                compensatedAtUtc);
             return Task.FromResult(true);
+        }
+
+        private void MarkTerminal(
+            Guid workflowInstanceId,
+            int stepOrder,
+            int attempt,
+            WorkflowStepAttemptStatus status,
+            string? errorMessage,
+            DateTimeOffset? completedAtUtc,
+            DateTimeOffset? compensatedAtUtc)
+        {
+            var existingIndex = _attempts.FindIndex(existing =>
+                existing.WorkflowInstanceId == workflowInstanceId &&
+                existing.StepOrder == stepOrder &&
+                existing.Attempt == attempt);
+
+            if (existingIndex < 0)
+            {
+                return;
+            }
+
+            var existing = _attempts[existingIndex];
+            _attempts[existingIndex] = existing with
+            {
+                Status = status,
+                ErrorMessage = errorMessage,
+                CompletedAtUtc = completedAtUtc ?? existing.CompletedAtUtc,
+                CompensatedAtUtc = compensatedAtUtc ?? existing.CompensatedAtUtc
+            };
         }
     }
 
