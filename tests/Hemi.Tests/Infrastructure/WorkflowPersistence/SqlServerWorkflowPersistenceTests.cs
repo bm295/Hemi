@@ -657,7 +657,9 @@ public sealed class SqlServerWorkflowPersistenceTests
             CorrelationId = Guid.NewGuid().ToString("D"),
             State = WorkflowState.Running,
             PayloadJson = """{"source":"payload-test"}""",
-            Attempt = 1
+            Attempt = 1,
+            LeaseOwner = "sql-payload-worker",
+            LeaseUntilUtc = DateTimeOffset.UtcNow.AddMinutes(5)
         };
 
         try
@@ -680,6 +682,7 @@ public sealed class SqlServerWorkflowPersistenceTests
                 WorkflowInstanceId = instance.Id,
                 WorkflowInstanceVersion = instance.Version,
                 WorkflowAttempt = instance.Attempt,
+                WorkflowLeaseOwner = instance.LeaseOwner,
                 CommandId = instance.CommandId
             };
             context.Set("source", "payload-test");
@@ -721,7 +724,9 @@ public sealed class SqlServerWorkflowPersistenceTests
             CorrelationId = Guid.NewGuid().ToString("D"),
             State = WorkflowState.Running,
             PayloadJson = """{"source":"journal-test"}""",
-            Attempt = 1
+            Attempt = 1,
+            LeaseOwner = "sql-journal-worker",
+            LeaseUntilUtc = DateTimeOffset.UtcNow.AddMinutes(5)
         };
 
         try
@@ -744,10 +749,12 @@ public sealed class SqlServerWorkflowPersistenceTests
                 new WorkflowJournalEntry(
                     instance.Id,
                     saved.Version,
+                    "sql-journal-worker",
                     PayloadJson: """{"source":"journal-test","completed":true}""",
                     State: new WorkflowStateJournalEntry(
                         WorkflowState.Succeeded,
-                        CompletedAtUtc: completedAtUtc),
+                        CompletedAtUtc: completedAtUtc,
+                        ClearLease: true),
                     Step: new WorkflowStepJournalEntry(
                         WorkflowStepJournalAction.Succeeded,
                         "CaptureOrderPaymentStep",
@@ -773,6 +780,8 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Contains(@"""completed"":true", persisted.PayloadJson, StringComparison.Ordinal);
             Assert.Equal(saved.Version + 2, persisted.Version);
             Assert.NotNull(persisted.CompletedAtUtc);
+            Assert.Null(persisted.LeaseOwner);
+            Assert.Null(persisted.LeaseUntilUtc);
 
             var attempt = Assert.Single(
                 await logRepository.GetStepAttemptsAsync(instance.Id));
@@ -806,7 +815,9 @@ public sealed class SqlServerWorkflowPersistenceTests
             CorrelationId = Guid.NewGuid().ToString("D"),
             State = WorkflowState.Running,
             PayloadJson = """{"source":"journal-rollback-test"}""",
-            Attempt = 1
+            Attempt = 1,
+            LeaseOwner = "sql-journal-rollback-worker",
+            LeaseUntilUtc = DateTimeOffset.UtcNow.AddMinutes(5)
         };
 
         try
@@ -830,6 +841,7 @@ public sealed class SqlServerWorkflowPersistenceTests
                     new WorkflowJournalEntry(
                         instance.Id,
                         saved.Version + 100,
+                        "sql-journal-rollback-worker",
                         State: new WorkflowStateJournalEntry(
                             WorkflowState.Succeeded,
                             CompletedAtUtc: completedAtUtc),
@@ -862,6 +874,91 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.NotNull(persisted);
             Assert.Equal(WorkflowState.Running, persisted.State);
             Assert.Equal(saved.Version, persisted.Version);
+        }
+        finally
+        {
+            await database.DeleteWorkflowInstanceAsync(instance.Id);
+        }
+    }
+
+    [SqlServerFact]
+    public async Task WorkflowJournal_rolls_back_step_when_lease_owner_does_not_match()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var instanceRepository = new WorkflowInstanceRepository(database.ConnectionString);
+        var logRepository = new WorkflowExecutionLogRepository(database.ConnectionString);
+        var journal = new SqlServerWorkflowJournal(database.ConnectionString);
+        var instance = new WorkflowInstanceEntity
+        {
+            Id = Guid.NewGuid(),
+            CommandId = Guid.NewGuid(),
+            WorkflowId = WorkflowIds.OrderFulfillment,
+            WorkflowName = "Order Fulfillment",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = WorkflowState.Running,
+            PayloadJson = """{"source":"journal-lease-test"}""",
+            Attempt = 1,
+            LeaseOwner = "current-worker",
+            LeaseUntilUtc = DateTimeOffset.UtcNow.AddMinutes(5)
+        };
+
+        try
+        {
+            await instanceRepository.SaveAsync(instance);
+            var saved = await instanceRepository.GetByIdAsync(instance.Id)
+                ?? throw new InvalidOperationException("Expected saved instance.");
+
+            _ = await logRepository.MarkStepRunningAsync(
+                new WorkflowStepAttemptStart(
+                    instance.Id,
+                    "CaptureOrderPaymentStep",
+                    StepOrder: 2,
+                    Attempt: 1,
+                    instance.CommandId,
+                    DateTimeOffset.UtcNow.AddSeconds(-1)));
+
+            var completedAtUtc = DateTimeOffset.UtcNow;
+            _ = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                journal.AppendAsync(
+                    new WorkflowJournalEntry(
+                        instance.Id,
+                        saved.Version,
+                        "stale-worker",
+                        State: new WorkflowStateJournalEntry(
+                            WorkflowState.Succeeded,
+                            CompletedAtUtc: completedAtUtc,
+                            ClearLease: true),
+                        Step: new WorkflowStepJournalEntry(
+                            WorkflowStepJournalAction.Succeeded,
+                            "CaptureOrderPaymentStep",
+                            StepOrder: 2,
+                            Attempt: 1,
+                            CompletedAtUtc: completedAtUtc),
+                        Event: new WorkflowEvent(
+                            WorkflowEvents.WorkflowSucceeded,
+                            instance.WorkflowId,
+                            instance.WorkflowName,
+                            instance.CorrelationId,
+                            WorkflowState.Succeeded,
+                            StepName: null,
+                            Error: null,
+                            completedAtUtc)
+                        {
+                            WorkflowInstanceId = instance.Id
+                        })));
+
+            var attempt = Assert.Single(
+                await logRepository.GetStepAttemptsAsync(instance.Id));
+            Assert.Equal(WorkflowStepAttemptStatus.Running, attempt.Status);
+
+            Assert.Empty(await logRepository.GetMessagesForWorkflowAsync(instance.Id));
+
+            var persisted = await instanceRepository.GetByIdAsync(instance.Id);
+            Assert.NotNull(persisted);
+            Assert.Equal(WorkflowState.Running, persisted.State);
+            Assert.Equal(saved.Version, persisted.Version);
+            Assert.Equal("current-worker", persisted.LeaseOwner);
+            Assert.NotNull(persisted.LeaseUntilUtc);
         }
         finally
         {

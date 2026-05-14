@@ -218,6 +218,7 @@ public sealed class WorkflowWorkerService(
             WorkflowInstanceId = instance.Id,
             WorkflowInstanceVersion = instance.Version,
             WorkflowAttempt = instance.Attempt,
+            WorkflowLeaseOwner = instance.LeaseOwner,
             CommandId = instance.CommandId,
             State = instance.State
         };

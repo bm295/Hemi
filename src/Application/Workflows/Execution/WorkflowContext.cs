@@ -26,6 +26,8 @@ public sealed class WorkflowContext
 
     public int WorkflowAttempt { get; set; }
 
+    public string? WorkflowLeaseOwner { get; set; }
+
     public Guid? CommandId { get; set; }
 
     public WorkflowState State { get; set; }

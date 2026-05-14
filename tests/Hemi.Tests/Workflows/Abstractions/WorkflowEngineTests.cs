@@ -121,6 +121,7 @@ public sealed class WorkflowEngineTests
             WorkflowInstanceId = Guid.NewGuid(),
             WorkflowInstanceVersion = 1,
             WorkflowAttempt = 1,
+            WorkflowLeaseOwner = "workflow-engine-test-worker",
             CommandId = Guid.NewGuid()
         };
         var definition = WorkflowDefinition.Create(
@@ -154,6 +155,7 @@ public sealed class WorkflowEngineTests
             WorkflowInstanceId = Guid.NewGuid(),
             WorkflowInstanceVersion = 1,
             WorkflowAttempt = 1,
+            WorkflowLeaseOwner = "workflow-engine-test-worker",
             CommandId = Guid.NewGuid()
         };
         var definition = WorkflowDefinition.Create(
@@ -166,6 +168,7 @@ public sealed class WorkflowEngineTests
         Assert.Contains(
             journal.Entries,
             entry =>
+                entry.ExpectedLeaseOwner == "workflow-engine-test-worker" &&
                 entry.Step?.Action == WorkflowStepJournalAction.Running &&
                 entry.Event?.EventName == WorkflowEvents.StepStarted);
         Assert.Contains(
@@ -180,6 +183,35 @@ public sealed class WorkflowEngineTests
                 entry.State?.State == WorkflowState.Succeeded &&
                 entry.Event?.EventName == WorkflowEvents.WorkflowSucceeded);
         Assert.Equal(3, context.WorkflowInstanceVersion);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_requires_lease_owner_for_journal_writes()
+    {
+        var services = new ServiceCollection();
+        var journal = new RecordingWorkflowJournal();
+        services.AddSingleton<IWorkflowJournal>(journal);
+        services.AddTransient<FirstStep>();
+
+        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var context = new WorkflowContext("test-workflow", "correlation-missing-lease")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 1,
+            WorkflowAttempt = 1,
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FirstStep));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => engine.ExecuteAsync("test-workflow", definition, context));
+
+        Assert.Equal(
+            "Workflow journal writes require an active workflow lease owner.",
+            exception.Message);
+        Assert.Empty(journal.Entries);
     }
 
     [Fact]

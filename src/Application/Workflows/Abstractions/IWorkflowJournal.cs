@@ -15,7 +15,8 @@ public sealed record WorkflowStateJournalEntry(
     WorkflowState State,
     string? LastError = null,
     DateTimeOffset? CompletedAtUtc = null,
-    DateTimeOffset? NextAttemptAtUtc = null);
+    DateTimeOffset? NextAttemptAtUtc = null,
+    bool ClearLease = false);
 
 public sealed record WorkflowStepJournalEntry(
     WorkflowStepJournalAction Action,
@@ -31,11 +32,13 @@ public sealed record WorkflowStepJournalEntry(
 public sealed record WorkflowPayloadJournalEntry(
     Guid WorkflowInstanceId,
     int ExpectedWorkflowVersion,
+    string ExpectedLeaseOwner,
     string PayloadJson);
 
 public sealed record WorkflowStateTransitionJournalEntry(
     Guid WorkflowInstanceId,
     int ExpectedWorkflowVersion,
+    string ExpectedLeaseOwner,
     WorkflowStateJournalEntry State,
     WorkflowEvent Event,
     string? PayloadJson = null);
@@ -43,6 +46,7 @@ public sealed record WorkflowStateTransitionJournalEntry(
 public sealed record WorkflowStepAttemptTransitionJournalEntry(
     Guid WorkflowInstanceId,
     int ExpectedWorkflowVersion,
+    string ExpectedLeaseOwner,
     WorkflowStepJournalEntry Step,
     WorkflowEvent Event,
     string? PayloadJson = null);
@@ -50,6 +54,7 @@ public sealed record WorkflowStepAttemptTransitionJournalEntry(
 public sealed record WorkflowJournalEntry(
     Guid WorkflowInstanceId,
     int ExpectedWorkflowVersion,
+    string ExpectedLeaseOwner,
     string? PayloadJson = null,
     WorkflowStateJournalEntry? State = null,
     WorkflowStepJournalEntry? Step = null,
@@ -68,6 +73,7 @@ public interface IWorkflowJournal
             new WorkflowJournalEntry(
                 entry.WorkflowInstanceId,
                 entry.ExpectedWorkflowVersion,
+                entry.ExpectedLeaseOwner,
                 PayloadJson: entry.PayloadJson),
             cancellationToken);
 
@@ -78,6 +84,7 @@ public interface IWorkflowJournal
             new WorkflowJournalEntry(
                 entry.WorkflowInstanceId,
                 entry.ExpectedWorkflowVersion,
+                entry.ExpectedLeaseOwner,
                 PayloadJson: entry.PayloadJson,
                 State: entry.State,
                 Event: entry.Event),
@@ -90,6 +97,7 @@ public interface IWorkflowJournal
             new WorkflowJournalEntry(
                 entry.WorkflowInstanceId,
                 entry.ExpectedWorkflowVersion,
+                entry.ExpectedLeaseOwner,
                 PayloadJson: entry.PayloadJson,
                 Step: entry.Step,
                 Event: entry.Event),

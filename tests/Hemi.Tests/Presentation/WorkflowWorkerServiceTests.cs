@@ -40,6 +40,7 @@ public sealed class WorkflowWorkerServiceTests
         Assert.True(context.Items.TryGetValue("marker", out var marker));
         var markerJson = Assert.IsType<JsonElement>(marker);
         Assert.Equal("from-payload", markerJson.GetString());
+        Assert.Equal(instance.LeaseOwner, context.WorkflowLeaseOwner);
         Assert.Null(store.State);
         Assert.Null(store.StateExpectedVersion);
         Assert.Null(store.NextAttemptAtUtc);
@@ -205,6 +206,7 @@ public sealed class WorkflowWorkerServiceTests
         Assert.Equal(WorkflowState.Succeeded, context.State);
         Assert.Equal(instance.Attempt, context.WorkflowAttempt);
         Assert.Equal(instance.Version, context.WorkflowInstanceVersion);
+        Assert.Equal(instance.LeaseOwner, context.WorkflowLeaseOwner);
         Assert.Null(store.State);
         Assert.DoesNotContain(@"""resumed"":true", store.PayloadJson, StringComparison.Ordinal);
     }

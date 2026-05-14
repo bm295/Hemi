@@ -136,6 +136,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 workflowDefinition,
                 ex,
                 WorkflowEvents.WorkflowFailed,
+                clearLease: !policies.EnableCompensation,
                 CancellationToken.None);
 
             if (policies.EnableCompensation)
@@ -174,6 +175,9 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 context.State == WorkflowState.Cancelled
                     ? WorkflowEvents.WorkflowCancelled
                     : WorkflowEvents.WorkflowFailed,
+                clearLease:
+                    !(policies.EnableCompensation &&
+                        context.State != WorkflowState.Cancelled),
                 CancellationToken.None);
 
             if (policies.EnableCompensation &&
@@ -453,6 +457,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 new WorkflowJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
+                    GetRequiredWorkflowLeaseOwner(context),
                     Event: CreateWorkflowEvent(
                         eventName,
                         workflowId,
@@ -492,10 +497,12 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 new WorkflowStateTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
+                    GetRequiredWorkflowLeaseOwner(context),
                     State: new WorkflowStateJournalEntry(
                         state,
                         error?.Message,
-                        completedAtUtc),
+                        completedAtUtc,
+                        ClearLease: IsTerminal(state)),
                     Event: CreateWorkflowEvent(
                         eventName,
                         workflowId,
@@ -530,6 +537,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
         IWorkflowDefinition workflowDefinition,
         Exception error,
         string eventName,
+        bool clearLease,
         CancellationToken cancellationToken)
     {
         if (CanUseJournal(context))
@@ -539,13 +547,15 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 new WorkflowStateTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
+                    GetRequiredWorkflowLeaseOwner(context),
                     PayloadJson: SerializeContext(context),
                     State: new WorkflowStateJournalEntry(
                         context.State,
                         error.Message,
                         IsTerminal(context.State)
                             ? DateTimeOffset.UtcNow
-                            : null),
+                            : null,
+                        ClearLease: clearLease),
                     Event: CreateWorkflowEvent(
                         eventName,
                         workflowId,
@@ -588,6 +598,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 new WorkflowStepAttemptTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
+                    GetRequiredWorkflowLeaseOwner(context),
                     Step: new WorkflowStepJournalEntry(
                         WorkflowStepJournalAction.Running,
                         indexedStep.Type.Name,
@@ -639,6 +650,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 new WorkflowStepAttemptTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
+                    GetRequiredWorkflowLeaseOwner(context),
                     PayloadJson: SerializeContext(context),
                     Step: new WorkflowStepJournalEntry(
                         WorkflowStepJournalAction.Succeeded,
@@ -696,6 +708,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 new WorkflowStepAttemptTransitionJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
+                    GetRequiredWorkflowLeaseOwner(context),
                     PayloadJson: SerializeContext(context),
                     Step: new WorkflowStepJournalEntry(
                         WorkflowStepJournalAction.Failed,
@@ -749,6 +762,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 new WorkflowJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
+                    GetRequiredWorkflowLeaseOwner(context),
                     PayloadJson: SerializeContext(context),
                     Step: new WorkflowStepJournalEntry(
                         WorkflowStepJournalAction.Compensated,
@@ -786,11 +800,13 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 new WorkflowJournalEntry(
                     context.WorkflowInstanceId!.Value,
                     context.WorkflowInstanceVersion,
+                    GetRequiredWorkflowLeaseOwner(context),
                     PayloadJson: SerializeContext(context),
                     State: new WorkflowStateJournalEntry(
                         WorkflowState.CompensationFailed,
                         error.Message,
-                        completedAtUtc),
+                        completedAtUtc,
+                        ClearLease: true),
                     Step: new WorkflowStepJournalEntry(
                         WorkflowStepJournalAction.CompensationFailed,
                         compensationStep.Step.GetType().Name,
@@ -877,6 +893,17 @@ public sealed class WorkflowEngine : IWorkflowEngine
         _workflowJournal is not null &&
         context.WorkflowInstanceId.HasValue &&
         context.WorkflowInstanceVersion > 0;
+
+    private static string GetRequiredWorkflowLeaseOwner(WorkflowContext context)
+    {
+        if (string.IsNullOrWhiteSpace(context.WorkflowLeaseOwner))
+        {
+            throw new InvalidOperationException(
+                "Workflow journal writes require an active workflow lease owner.");
+        }
+
+        return context.WorkflowLeaseOwner;
+    }
 
     private static string SerializeContext(WorkflowContext context) =>
         JsonSerializer.Serialize(

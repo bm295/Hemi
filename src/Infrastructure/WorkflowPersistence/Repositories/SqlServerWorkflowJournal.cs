@@ -28,6 +28,7 @@ public sealed class SqlServerWorkflowJournal(
             new WorkflowJournalEntry(
                 entry.WorkflowInstanceId,
                 entry.ExpectedWorkflowVersion,
+                entry.ExpectedLeaseOwner,
                 PayloadJson: entry.PayloadJson),
             cancellationToken);
     }
@@ -44,6 +45,7 @@ public sealed class SqlServerWorkflowJournal(
             new WorkflowJournalEntry(
                 entry.WorkflowInstanceId,
                 entry.ExpectedWorkflowVersion,
+                entry.ExpectedLeaseOwner,
                 PayloadJson: entry.PayloadJson,
                 State: entry.State,
                 Event: entry.Event),
@@ -62,6 +64,7 @@ public sealed class SqlServerWorkflowJournal(
             new WorkflowJournalEntry(
                 entry.WorkflowInstanceId,
                 entry.ExpectedWorkflowVersion,
+                entry.ExpectedLeaseOwner,
                 PayloadJson: entry.PayloadJson,
                 Step: entry.Step,
                 Event: entry.Event),
@@ -93,6 +96,14 @@ public sealed class SqlServerWorkflowJournal(
 
         try
         {
+            await VerifyWorkflowLeaseAsync(
+                connection,
+                transaction,
+                entry.WorkflowInstanceId,
+                entry.ExpectedWorkflowVersion,
+                entry.ExpectedLeaseOwner,
+                cancellationToken);
+
             if (entry.PayloadJson is not null)
             {
                 workflowInstanceVersion = await UpdatePayloadAsync(
@@ -159,6 +170,37 @@ public sealed class SqlServerWorkflowJournal(
         return new WorkflowJournalResult(
             workflowInstanceVersion,
             stepAttempt);
+    }
+
+    private static async Task VerifyWorkflowLeaseAsync(
+        SqlConnection connection,
+        SqlTransaction transaction,
+        Guid workflowInstanceId,
+        int expectedVersion,
+        string expectedLeaseOwner,
+        CancellationToken cancellationToken)
+    {
+        const string sql = """
+            SELECT 1
+            FROM dbo.WorkflowInstance WITH (UPDLOCK, HOLDLOCK)
+            WHERE Id = @Id
+              AND Version = @ExpectedVersion
+              AND LeaseOwner = @ExpectedLeaseOwner;
+            """;
+
+        await using var command = new SqlCommand(sql, connection, transaction);
+        _ = command.Parameters.Add("@Id", SqlDbType.UniqueIdentifier).Value =
+            workflowInstanceId;
+        _ = command.Parameters.Add("@ExpectedVersion", SqlDbType.Int).Value =
+            expectedVersion;
+        _ = command.Parameters.Add("@ExpectedLeaseOwner", SqlDbType.NVarChar, 128).Value =
+            expectedLeaseOwner;
+
+        if (await command.ExecuteScalarAsync(cancellationToken) is null)
+        {
+            throw new InvalidOperationException(
+                "Workflow journal append failed due to stale workflow version or lease owner.");
+        }
     }
 
     private static async Task<int> UpdatePayloadAsync(
@@ -256,7 +298,7 @@ public sealed class SqlServerWorkflowJournal(
         AddNullable(command, "@CompletedAtUtc", SqlDbType.DateTimeOffset, state.CompletedAtUtc);
         AddNullable(command, "@NextAttemptAtUtc", SqlDbType.DateTimeOffset, state.NextAttemptAtUtc);
         _ = command.Parameters.Add("@ClearLease", SqlDbType.Bit).Value =
-            state.State != WorkflowState.Running;
+            state.ClearLease;
 
         var version = await command.ExecuteScalarAsync(cancellationToken);
         if (version is null)
@@ -470,6 +512,13 @@ public sealed class SqlServerWorkflowJournal(
             throw new ArgumentOutOfRangeException(
                 nameof(entry),
                 "Expected workflow version must be greater than zero.");
+        }
+
+        if (string.IsNullOrWhiteSpace(entry.ExpectedLeaseOwner))
+        {
+            throw new ArgumentException(
+                "Expected lease owner is required.",
+                nameof(entry));
         }
 
         if (entry.PayloadJson is not null &&
