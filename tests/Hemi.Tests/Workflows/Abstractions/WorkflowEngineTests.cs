@@ -165,29 +165,97 @@ public sealed class WorkflowEngineTests
         await engine.ExecuteAsync("test-workflow", definition, context);
 
         Assert.Empty(publisher.Events);
+        Assert.All(
+            journal.Entries,
+            entry =>
+            {
+                Assert.Equal("workflow-engine-test-worker", entry.ExpectedLeaseOwner);
+                Assert.NotEqual(RecordedWorkflowJournalOperation.GenericAppend, entry.Operation);
+            });
         Assert.Contains(
             journal.Entries,
             entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StateTransition &&
                 entry.State?.State == WorkflowState.Running &&
                 entry.Event?.EventName == WorkflowEvents.WorkflowStarted);
         Assert.Contains(
             journal.Entries,
             entry =>
-                entry.ExpectedLeaseOwner == "workflow-engine-test-worker" &&
+                entry.Operation == RecordedWorkflowJournalOperation.StepAttemptTransition &&
                 entry.Step?.Action == WorkflowStepJournalAction.Running &&
                 entry.Event?.EventName == WorkflowEvents.StepStarted);
         Assert.Contains(
             journal.Entries,
             entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StepAttemptTransition &&
                 entry.PayloadJson is not null &&
                 entry.Step?.Action == WorkflowStepJournalAction.Succeeded &&
                 entry.Event?.EventName == WorkflowEvents.StepCompleted);
         Assert.Contains(
             journal.Entries,
             entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StateTransition &&
                 entry.State?.State == WorkflowState.Succeeded &&
                 entry.Event?.EventName == WorkflowEvents.WorkflowSucceeded);
         Assert.Equal(4, context.WorkflowInstanceVersion);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_journals_step_failure_and_terminal_failure_with_explicit_methods()
+    {
+        var services = new ServiceCollection();
+        var journal = new RecordingWorkflowJournal();
+        services.AddSingleton<IWorkflowJournal>(journal);
+        services.AddTransient<FailingStep>();
+
+        var policy = new WorkflowPolicies(
+            maxRetryAttempts: 0,
+            retryDelay: TimeSpan.Zero,
+            enableCompensation: false,
+            stopOnFirstFailure: true,
+            timeout: TimeSpan.FromMinutes(5));
+        var engine = CreateEngine(
+            services,
+            new RecordingWorkflowEventPublisher(),
+            policy);
+        var context = new WorkflowContext("test-workflow", "correlation-journal-failed")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 1,
+            WorkflowAttempt = 1,
+            WorkflowLeaseOwner = "workflow-engine-test-worker",
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FailingStep));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => engine.ExecuteAsync("test-workflow", definition, context));
+
+        Assert.Equal("Step failed.", exception.Message);
+        Assert.All(
+            journal.Entries,
+            entry =>
+            {
+                Assert.Equal("workflow-engine-test-worker", entry.ExpectedLeaseOwner);
+                Assert.NotEqual(RecordedWorkflowJournalOperation.GenericAppend, entry.Operation);
+            });
+        Assert.Contains(
+            journal.Entries,
+            entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StepAttemptTransition &&
+                entry.PayloadJson is not null &&
+                entry.Step?.Action == WorkflowStepJournalAction.Failed &&
+                entry.Event?.EventName == WorkflowEvents.StepFailed);
+        Assert.Contains(
+            journal.Entries,
+            entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StateTransition &&
+                entry.PayloadJson is not null &&
+                entry.State?.State == WorkflowState.Failed &&
+                entry.State.ClearLease &&
+                entry.Event?.EventName == WorkflowEvents.WorkflowFailed);
     }
 
     [Fact]
@@ -220,6 +288,35 @@ public sealed class WorkflowEngineTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_stale_workflow_lease_owner_cannot_append_journal_records()
+    {
+        var services = new ServiceCollection();
+        var journal = new RecordingWorkflowJournal(activeLeaseOwner: "current-worker");
+        services.AddSingleton(new StepRecorder());
+        services.AddSingleton<IWorkflowJournal>(journal);
+        services.AddTransient<FirstStep>();
+
+        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var context = new WorkflowContext("test-workflow", "correlation-stale-lease")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 1,
+            WorkflowAttempt = 1,
+            WorkflowLeaseOwner = "stale-worker",
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FirstStep));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => engine.ExecuteAsync("test-workflow", definition, context));
+
+        Assert.Equal("Workflow journal append failed due to stale workflow lease owner.", exception.Message);
+        Assert.Empty(journal.Entries);
+    }
+
+    [Fact]
     public async Task ExecuteAsync_journals_compensated_steps_with_step_event()
     {
         var services = new ServiceCollection();
@@ -248,12 +345,28 @@ public sealed class WorkflowEngineTests
             () => engine.ExecuteAsync("test-workflow", definition, context));
 
         Assert.Equal("Step failed.", exception.Message);
+        Assert.All(
+            journal.Entries,
+            entry =>
+            {
+                Assert.Equal("workflow-engine-test-worker", entry.ExpectedLeaseOwner);
+                Assert.NotEqual(RecordedWorkflowJournalOperation.GenericAppend, entry.Operation);
+            });
         Assert.Contains(
             journal.Entries,
             entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StepAttemptTransition &&
+                entry.ExpectedLeaseOwner == "workflow-engine-test-worker" &&
                 entry.PayloadJson is not null &&
                 entry.Step?.Action == WorkflowStepJournalAction.Compensated &&
                 entry.Event?.EventName == WorkflowEvents.StepCompensated);
+        Assert.Contains(
+            journal.Entries,
+            entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StateTransition &&
+                entry.State?.State == WorkflowState.Compensated &&
+                entry.State.ClearLease &&
+                entry.Event?.EventName == WorkflowEvents.CompensationCompleted);
     }
 
     [Fact]
@@ -287,12 +400,21 @@ public sealed class WorkflowEngineTests
             () => engine.ExecuteAsync("test-workflow", definition, context));
 
         Assert.Equal("Compensation failed.", exception.Message);
+        Assert.All(
+            journal.Entries,
+            entry =>
+            {
+                Assert.Equal("workflow-engine-test-worker", entry.ExpectedLeaseOwner);
+                Assert.NotEqual(RecordedWorkflowJournalOperation.GenericAppend, entry.Operation);
+            });
         Assert.Contains(
             journal.Entries,
             entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StepAttemptTransition &&
                 entry.PayloadJson is not null &&
                 entry.Step?.Action == WorkflowStepJournalAction.CompensationFailed &&
                 entry.State?.State == WorkflowState.CompensationFailed &&
+                entry.State.ClearLease &&
                 entry.Event?.EventName == WorkflowEvents.CompensationFailed);
     }
 
@@ -999,7 +1121,16 @@ public sealed class WorkflowEngineTests
         }
     }
 
+    private enum RecordedWorkflowJournalOperation
+    {
+        GenericAppend,
+        PayloadUpdate,
+        StateTransition,
+        StepAttemptTransition
+    }
+
     private sealed record RecordedWorkflowJournalEntry(
+        RecordedWorkflowJournalOperation Operation,
         Guid WorkflowInstanceId,
         int ExpectedWorkflowVersion,
         string ExpectedLeaseOwner,
@@ -1008,7 +1139,8 @@ public sealed class WorkflowEngineTests
         WorkflowStepJournalEntry? Step = null,
         WorkflowEvent? Event = null);
 
-    private sealed class RecordingWorkflowJournal : IWorkflowJournal
+    private sealed class RecordingWorkflowJournal(string? activeLeaseOwner = null)
+        : IWorkflowJournal
     {
         public List<RecordedWorkflowJournalEntry> Entries { get; } = [];
 
@@ -1018,6 +1150,7 @@ public sealed class WorkflowEngineTests
         {
             return Record(
                 new RecordedWorkflowJournalEntry(
+                    RecordedWorkflowJournalOperation.PayloadUpdate,
                     entry.WorkflowInstanceId,
                     entry.ExpectedWorkflowVersion,
                     entry.ExpectedLeaseOwner,
@@ -1030,6 +1163,7 @@ public sealed class WorkflowEngineTests
         {
             return Record(
                 new RecordedWorkflowJournalEntry(
+                    RecordedWorkflowJournalOperation.StateTransition,
                     entry.WorkflowInstanceId,
                     entry.ExpectedWorkflowVersion,
                     entry.ExpectedLeaseOwner,
@@ -1044,6 +1178,7 @@ public sealed class WorkflowEngineTests
         {
             return Record(
                 new RecordedWorkflowJournalEntry(
+                    RecordedWorkflowJournalOperation.StepAttemptTransition,
                     entry.WorkflowInstanceId,
                     entry.ExpectedWorkflowVersion,
                     entry.ExpectedLeaseOwner,
@@ -1056,6 +1191,16 @@ public sealed class WorkflowEngineTests
         private Task<WorkflowJournalResult> Record(
             RecordedWorkflowJournalEntry entry)
         {
+            if (activeLeaseOwner is not null &&
+                !string.Equals(
+                    entry.ExpectedLeaseOwner,
+                    activeLeaseOwner,
+                    StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    "Workflow journal append failed due to stale workflow lease owner.");
+            }
+
             Entries.Add(entry);
 
             var version = entry.ExpectedWorkflowVersion;
