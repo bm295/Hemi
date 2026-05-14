@@ -126,11 +126,14 @@ public sealed class WorkflowWorkerService(
         }
         catch (Exception ex)
         {
-            workflowTracing?.RecordException(activity, ex);
-            workflowMetrics?.RecordCommandFailed(
-                command,
-                stopwatch.Elapsed,
-                ex);
+            if (IsTerminal(context.State))
+            {
+                workflowTracing?.RecordException(activity, ex);
+                workflowMetrics?.RecordCommandFailed(
+                    command,
+                    stopwatch.Elapsed,
+                    ex);
+            }
 
             await HandleExecutionFailureAsync(
                 instance,

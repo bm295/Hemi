@@ -1,7 +1,9 @@
+using System.Diagnostics.Metrics;
 using System.Text.Json;
 using Hemi.Application.Workflows.Abstractions;
 using Hemi.Application.Workflows.Execution;
 using Hemi.Domain.Workflows;
+using Hemi.Infrastructure.Monitoring;
 using Hemi.Presentation.BackgroundWorkers;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -74,6 +76,35 @@ public sealed class WorkflowWorkerServiceTests
     }
 
     [Fact]
+    public async Task Worker_does_not_record_failed_metric_for_pre_engine_dispatch_failure()
+    {
+        var outcomes = await CaptureCommandMetricOutcomesAsync(async metrics =>
+        {
+            var instance = CreateInstance(
+                attempt: 1,
+                version: 4,
+                payloadJson: """{"marker":"pre-engine-failure"}""");
+            var store = new PollingWorkflowInstanceStore(instance);
+            var dispatcher = new RecordingDispatcher(_ =>
+                throw new InvalidOperationException("dispatcher failed before terminal state"));
+
+            using var services = CreateServices(dispatcher);
+            using var worker = CreateWorker(
+                services,
+                store,
+                metrics);
+
+            await worker.StartAsync(CancellationToken.None);
+
+            _ = await store.StateUpdated.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await worker.StopAsync(CancellationToken.None);
+        });
+
+        Assert.Contains("received", outcomes);
+        Assert.DoesNotContain("failed", outcomes);
+    }
+
+    [Fact]
     public async Task Worker_does_not_overwrite_terminal_dispatch_failure_with_pending()
     {
         var instance = CreateInstance(
@@ -103,13 +134,91 @@ public sealed class WorkflowWorkerServiceTests
         Assert.Null(store.NextAttemptAtUtc);
     }
 
+    [Fact]
+    public async Task Worker_records_failed_metric_for_terminal_dispatch_failure()
+    {
+        var outcomes = await CaptureCommandMetricOutcomesAsync(async metrics =>
+        {
+            var instance = CreateInstance(
+                attempt: 1,
+                version: 4,
+                payloadJson: """{"marker":"terminal-failure"}""");
+            var store = new PollingWorkflowInstanceStore(instance);
+            var dispatcher = new RecordingDispatcher(context =>
+            {
+                context.State = WorkflowState.Failed;
+                throw new InvalidOperationException("engine persisted terminal failure");
+            });
+
+            using var services = CreateServices(dispatcher);
+            using var worker = CreateWorker(
+                services,
+                store,
+                metrics);
+
+            await worker.StartAsync(CancellationToken.None);
+
+            _ = await dispatcher.Handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await worker.StopAsync(CancellationToken.None);
+        });
+
+        Assert.Contains("received", outcomes);
+        Assert.Contains("failed", outcomes);
+    }
+
     private static WorkflowWorkerService CreateWorker(
         ServiceProvider services,
-        IWorkflowInstanceStore store) =>
+        IWorkflowInstanceStore store,
+        WorkflowMetrics? workflowMetrics = null) =>
         new(
             services.GetRequiredService<IServiceScopeFactory>(),
             store,
-            NullLogger<WorkflowWorkerService>.Instance);
+            NullLogger<WorkflowWorkerService>.Instance,
+            workflowMetrics);
+
+    private static async Task<IReadOnlyCollection<string>> CaptureCommandMetricOutcomesAsync(
+        Func<WorkflowMetrics, Task> action)
+    {
+        var outcomes = new List<string>();
+        using var listener = new MeterListener();
+        listener.InstrumentPublished = (instrument, meterListener) =>
+        {
+            if (instrument.Meter.Name == WorkflowMetrics.MeterName &&
+                instrument.Name == "hemi.workflow.commands")
+            {
+                meterListener.EnableMeasurementEvents(instrument);
+            }
+        };
+        listener.SetMeasurementEventCallback<long>((_, _, tags, _) =>
+        {
+            var outcome = GetTagValue(tags, "outcome");
+            if (outcome is not null)
+            {
+                outcomes.Add(outcome);
+            }
+        });
+        listener.Start();
+
+        using var metrics = new WorkflowMetrics();
+        await action(metrics);
+
+        return outcomes;
+    }
+
+    private static string? GetTagValue(
+        ReadOnlySpan<KeyValuePair<string, object?>> tags,
+        string key)
+    {
+        foreach (var tag in tags)
+        {
+            if (string.Equals(tag.Key, key, StringComparison.Ordinal))
+            {
+                return tag.Value?.ToString();
+            }
+        }
+
+        return null;
+    }
 
     private static ServiceProvider CreateServices(
         IWorkflowDispatcher dispatcher)
