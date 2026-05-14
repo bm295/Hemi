@@ -611,6 +611,16 @@ public sealed class SqlServerWorkflowPersistenceTests
                     nextAttemptAtUtc: DateTimeOffset.UtcNow.AddSeconds(-1));
 
                 Assert.False(reset);
+
+                var persisted = await repository.GetByIdAsync(instance.Id);
+
+                Assert.NotNull(persisted);
+                Assert.Equal(instance.State, persisted.State);
+                Assert.Equal(instance.Version, persisted.Version);
+                Assert.Null(persisted.NextAttemptAtUtc);
+                Assert.Null(persisted.LeaseOwner);
+                Assert.Null(persisted.LeaseUntilUtc);
+                Assert.NotNull(persisted.CompletedAtUtc);
             }
 
             var claimed = await repository.ClaimDueInstancesAsync(
@@ -1049,6 +1059,76 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Null(afterPublish.ErrorMessage);
             Assert.Null(afterPublish.LeaseOwner);
             Assert.Null(afterPublish.LeaseUntilUtc);
+        }
+        finally
+        {
+            await database.DeleteWorkflowInstanceAsync(instance.Id);
+        }
+    }
+
+    [SqlServerFact]
+    public async Task WorkflowOutboxStore_pending_message_can_be_claimed_by_only_one_publisher()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var instanceRepository = new WorkflowInstanceRepository(database.ConnectionString);
+        IWorkflowOutboxStore outboxStore = new WorkflowExecutionLogRepository(database.ConnectionString);
+        var nowUtc = DateTimeOffset.UtcNow;
+        var instance = new WorkflowInstanceEntity
+        {
+            Id = Guid.NewGuid(),
+            WorkflowId = WorkflowIds.OrderFulfillment,
+            WorkflowName = "Order Fulfillment",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = WorkflowState.Running,
+            PayloadJson = """{"source":"outbox-concurrency-test"}"""
+        };
+
+        try
+        {
+            await instanceRepository.SaveAsync(instance);
+
+            var message = await outboxStore.SaveMessageAsync(
+                new WorkflowOutboxMessageDraft(
+                    instance.Id,
+                    "workflow.concurrent-claim",
+                    "workflow.events",
+                    """{"state":"pending"}""",
+                    CreatedAtUtc: nowUtc.AddMinutes(-1),
+                    NextAttemptAtUtc: nowUtc.AddSeconds(-1)));
+
+            var claimResults = await Task.WhenAll(
+                outboxStore.ClaimPendingMessagesAsync(
+                    nowUtc,
+                    "publisher-one",
+                    TimeSpan.FromMinutes(5),
+                    batchSize: 1),
+                outboxStore.ClaimPendingMessagesAsync(
+                    nowUtc,
+                    "publisher-two",
+                    TimeSpan.FromMinutes(5),
+                    batchSize: 1));
+
+            var claimedMessages = claimResults.SelectMany(result => result).ToArray();
+            var claimed = Assert.Single(claimedMessages);
+
+            Assert.Equal(message.Id, claimed.Id);
+            Assert.True(claimed.LeaseOwner is "publisher-one" or "publisher-two");
+            Assert.NotNull(claimed.LeaseUntilUtc);
+
+            var notClaimedAgain = await outboxStore.ClaimPendingMessagesAsync(
+                nowUtc,
+                "publisher-three",
+                TimeSpan.FromMinutes(5),
+                batchSize: 1);
+
+            Assert.Empty(notClaimedAgain);
+
+            var persisted = Assert.Single(
+                await outboxStore.GetMessagesForWorkflowAsync(instance.Id));
+            Assert.Equal(message.Id, persisted.Id);
+            Assert.Equal(WorkflowOutboxStatus.Pending, persisted.Status);
+            Assert.True(persisted.LeaseOwner is "publisher-one" or "publisher-two");
+            Assert.NotNull(persisted.LeaseUntilUtc);
         }
         finally
         {
