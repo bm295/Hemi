@@ -191,6 +191,91 @@ BEGIN
 END;
 GO
 
+IF EXISTS (
+    SELECT 1
+    FROM sys.indexes
+    WHERE name = N'IX_WorkflowOutboxMessage_Status_NextAttempt_Lease'
+      AND object_id = OBJECT_ID(N'dbo.WorkflowOutboxMessage')
+)
+AND (
+    NOT EXISTS (
+        SELECT 1
+        FROM sys.indexes i
+        INNER JOIN sys.index_columns ic
+            ON ic.object_id = i.object_id
+           AND ic.index_id = i.index_id
+        INNER JOIN sys.columns c
+            ON c.object_id = ic.object_id
+           AND c.column_id = ic.column_id
+        WHERE i.name = N'IX_WorkflowOutboxMessage_Status_NextAttempt_Lease'
+          AND i.object_id = OBJECT_ID(N'dbo.WorkflowOutboxMessage')
+          AND ic.is_included_column = 0
+          AND ic.key_ordinal = 1
+          AND c.name = N'Status'
+    )
+    OR NOT EXISTS (
+        SELECT 1
+        FROM sys.indexes i
+        INNER JOIN sys.index_columns ic
+            ON ic.object_id = i.object_id
+           AND ic.index_id = i.index_id
+        INNER JOIN sys.columns c
+            ON c.object_id = ic.object_id
+           AND c.column_id = ic.column_id
+        WHERE i.name = N'IX_WorkflowOutboxMessage_Status_NextAttempt_Lease'
+          AND i.object_id = OBJECT_ID(N'dbo.WorkflowOutboxMessage')
+          AND ic.is_included_column = 0
+          AND ic.key_ordinal = 2
+          AND c.name = N'NextAttemptAtUtc'
+    )
+    OR NOT EXISTS (
+        SELECT 1
+        FROM sys.indexes i
+        INNER JOIN sys.index_columns ic
+            ON ic.object_id = i.object_id
+           AND ic.index_id = i.index_id
+        INNER JOIN sys.columns c
+            ON c.object_id = ic.object_id
+           AND c.column_id = ic.column_id
+        WHERE i.name = N'IX_WorkflowOutboxMessage_Status_NextAttempt_Lease'
+          AND i.object_id = OBJECT_ID(N'dbo.WorkflowOutboxMessage')
+          AND ic.is_included_column = 0
+          AND ic.key_ordinal = 3
+          AND c.name = N'LeaseUntilUtc'
+    )
+    OR NOT EXISTS (
+        SELECT 1
+        FROM sys.indexes i
+        INNER JOIN sys.index_columns ic
+            ON ic.object_id = i.object_id
+           AND ic.index_id = i.index_id
+        INNER JOIN sys.columns c
+            ON c.object_id = ic.object_id
+           AND c.column_id = ic.column_id
+        WHERE i.name = N'IX_WorkflowOutboxMessage_Status_NextAttempt_Lease'
+          AND i.object_id = OBJECT_ID(N'dbo.WorkflowOutboxMessage')
+          AND ic.is_included_column = 0
+          AND ic.key_ordinal = 4
+          AND c.name = N'CreatedAtUtc'
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM sys.indexes i
+        INNER JOIN sys.index_columns ic
+            ON ic.object_id = i.object_id
+           AND ic.index_id = i.index_id
+        WHERE i.name = N'IX_WorkflowOutboxMessage_Status_NextAttempt_Lease'
+          AND i.object_id = OBJECT_ID(N'dbo.WorkflowOutboxMessage')
+          AND ic.is_included_column = 0
+          AND ic.key_ordinal > 4
+    )
+)
+BEGIN
+    DROP INDEX IX_WorkflowOutboxMessage_Status_NextAttempt_Lease
+        ON dbo.WorkflowOutboxMessage;
+END;
+GO
+
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_WorkflowOutboxMessage_Status_NextAttempt_Lease' AND object_id = OBJECT_ID(N'dbo.WorkflowOutboxMessage'))
 BEGIN
     CREATE INDEX IX_WorkflowOutboxMessage_Status_NextAttempt_Lease

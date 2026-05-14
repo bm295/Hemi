@@ -59,6 +59,14 @@ public sealed class SqlServerWorkflowPersistenceTests
         Assert.Contains("UX_WorkflowStepExecution_Instance_Order_Attempt", indexes);
         Assert.Contains("IX_WorkflowOutboxMessage_Status_NextAttempt_Lease", indexes);
         Assert.Contains("IX_WorkflowOutboxMessage_WorkflowInstanceId", indexes);
+
+        var outboxLeaseIndexColumns = await GetIndexKeyColumnNamesAsync(
+            database.ConnectionString,
+            "WorkflowOutboxMessage",
+            "IX_WorkflowOutboxMessage_Status_NextAttempt_Lease");
+        Assert.Equal(
+            ["Status", "NextAttemptAtUtc", "LeaseUntilUtc", "CreatedAtUtc"],
+            outboxLeaseIndexColumns);
     }
 
     [SqlServerFact]
@@ -1420,6 +1428,46 @@ public sealed class SqlServerWorkflowPersistenceTests
         }
 
         return names;
+    }
+
+    private static async Task<string[]> GetIndexKeyColumnNamesAsync(
+        string connectionString,
+        string tableName,
+        string indexName)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        const string sql = """
+            SELECT c.name
+            FROM sys.indexes i
+            INNER JOIN sys.index_columns ic
+                ON ic.object_id = i.object_id
+               AND ic.index_id = i.index_id
+            INNER JOIN sys.columns c
+                ON c.object_id = ic.object_id
+               AND c.column_id = ic.column_id
+            WHERE i.object_id = OBJECT_ID(@TableName)
+              AND i.name = @IndexName
+              AND ic.is_included_column = 0
+              AND ic.key_ordinal > 0
+            ORDER BY ic.key_ordinal;
+            """;
+
+        await using var command = new SqlCommand(sql, connection);
+        _ = command.Parameters.Add("@TableName", SqlDbType.NVarChar, 256).Value =
+            $"dbo.{tableName}";
+        _ = command.Parameters.Add("@IndexName", SqlDbType.NVarChar, 128).Value =
+            indexName;
+
+        var names = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            names.Add(reader.GetString(0));
+        }
+
+        return [.. names];
     }
 
     private sealed class SqlWorkflowApiFactory(string connectionString)
