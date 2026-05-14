@@ -882,7 +882,7 @@ public sealed class SqlServerWorkflowPersistenceTests
     }
 
     [SqlServerFact]
-    public async Task WorkflowJournal_rolls_back_step_when_lease_owner_does_not_match()
+    public async Task WorkflowJournal_rejects_wrong_lease_owner_and_rolls_back_step_and_outbox_changes()
     {
         await using var database = await WorkflowSqlTestDatabase.CreateAsync();
         var instanceRepository = new WorkflowInstanceRepository(database.ConnectionString);
@@ -918,7 +918,7 @@ public sealed class SqlServerWorkflowPersistenceTests
                     DateTimeOffset.UtcNow.AddSeconds(-1)));
 
             var completedAtUtc = DateTimeOffset.UtcNow;
-            _ = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
                 journal.AppendStepAttemptTransitionAsync(
                     new WorkflowStepAttemptTransitionJournalEntry(
                         instance.Id,
@@ -947,6 +947,10 @@ public sealed class SqlServerWorkflowPersistenceTests
                             CompletedAtUtc: completedAtUtc,
                             ClearLease: true))));
 
+            Assert.Equal(
+                "Workflow journal append failed due to stale workflow version or lease owner.",
+                exception.Message);
+
             var attempt = Assert.Single(
                 await logRepository.GetStepAttemptsAsync(instance.Id));
             Assert.Equal(WorkflowStepAttemptStatus.Running, attempt.Status);
@@ -959,6 +963,86 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Equal(saved.Version, persisted.Version);
             Assert.Equal("current-worker", persisted.LeaseOwner);
             Assert.NotNull(persisted.LeaseUntilUtc);
+        }
+        finally
+        {
+            await database.DeleteWorkflowInstanceAsync(instance.Id);
+        }
+    }
+
+    [SqlServerFact]
+    public async Task WorkflowJournal_retry_scheduling_clears_workflow_lease_and_writes_event()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var instanceRepository = new WorkflowInstanceRepository(database.ConnectionString);
+        var logRepository = new WorkflowExecutionLogRepository(database.ConnectionString);
+        var journal = new SqlServerWorkflowJournal(database.ConnectionString);
+        var instance = new WorkflowInstanceEntity
+        {
+            Id = Guid.NewGuid(),
+            CommandId = Guid.NewGuid(),
+            WorkflowId = WorkflowIds.OrderFulfillment,
+            WorkflowName = "Order Fulfillment",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = WorkflowState.Running,
+            PayloadJson = """{"source":"retry-schedule-test"}""",
+            Attempt = 1,
+            LeaseOwner = "retry-schedule-worker",
+            LeaseUntilUtc = DateTimeOffset.UtcNow.AddMinutes(5)
+        };
+
+        try
+        {
+            await instanceRepository.SaveAsync(instance);
+            var saved = await instanceRepository.GetByIdAsync(instance.Id)
+                ?? throw new InvalidOperationException("Expected saved instance.");
+
+            var occurredAtUtc = DateTimeOffset.UtcNow;
+            var nextAttemptAtUtc = occurredAtUtc.AddSeconds(2);
+            var result = await journal.AppendWorkflowStateTransitionAsync(
+                new WorkflowStateTransitionJournalEntry(
+                    instance.Id,
+                    saved.Version,
+                    "retry-schedule-worker",
+                    State: new WorkflowStateJournalEntry(
+                        WorkflowState.Pending,
+                        LastError: "temporary dispatch failure",
+                        CompletedAtUtc: null,
+                        NextAttemptAtUtc: nextAttemptAtUtc,
+                        ClearLease: true),
+                    Event: new WorkflowEvent(
+                        WorkflowEvents.RetryScheduled,
+                        instance.WorkflowId,
+                        instance.WorkflowName,
+                        instance.CorrelationId,
+                        WorkflowState.Pending,
+                        StepName: null,
+                        Error: new InvalidOperationException("temporary dispatch failure"),
+                        occurredAtUtc)
+                    {
+                        WorkflowInstanceId = instance.Id
+                    },
+                    PayloadJson: """{"source":"retry-schedule-test","retry":true}"""));
+
+            Assert.Equal(saved.Version + 2, result.WorkflowInstanceVersion);
+
+            var persisted = await instanceRepository.GetByIdAsync(instance.Id);
+            Assert.NotNull(persisted);
+            Assert.Equal(WorkflowState.Pending, persisted.State);
+            Assert.Equal("temporary dispatch failure", persisted.LastError);
+            Assert.Equal(nextAttemptAtUtc, persisted.NextAttemptAtUtc);
+            Assert.Null(persisted.CompletedAtUtc);
+            Assert.Contains(@"""retry"":true", persisted.PayloadJson, StringComparison.Ordinal);
+            Assert.Null(persisted.LeaseOwner);
+            Assert.Null(persisted.LeaseUntilUtc);
+
+            var message = Assert.Single(
+                await logRepository.GetMessagesForWorkflowAsync(instance.Id));
+            Assert.Equal(WorkflowEvents.RetryScheduled, message.MessageType);
+            Assert.Equal(WorkflowOutboxStatus.Pending, message.Status);
+            Assert.Equal(occurredAtUtc, message.NextAttemptAtUtc);
+            Assert.Null(message.LeaseOwner);
+            Assert.Null(message.LeaseUntilUtc);
         }
         finally
         {
@@ -1256,6 +1340,149 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Equal(WorkflowOutboxStatus.Pending, persisted.Status);
             Assert.True(persisted.LeaseOwner is "publisher-one" or "publisher-two");
             Assert.NotNull(persisted.LeaseUntilUtc);
+        }
+        finally
+        {
+            await database.DeleteWorkflowInstanceAsync(instance.Id);
+        }
+    }
+
+    [SqlServerFact]
+    public async Task WorkflowOutboxStore_publish_and_fail_require_current_claiming_lease_owner()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var instanceRepository = new WorkflowInstanceRepository(database.ConnectionString);
+        IWorkflowOutboxStore outboxStore = new WorkflowExecutionLogRepository(database.ConnectionString);
+        var nowUtc = DateTimeOffset.UtcNow;
+        var instance = new WorkflowInstanceEntity
+        {
+            Id = Guid.NewGuid(),
+            WorkflowId = WorkflowIds.OrderFulfillment,
+            WorkflowName = "Order Fulfillment",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = WorkflowState.Running,
+            PayloadJson = """{"source":"outbox-completion-lease-test"}"""
+        };
+
+        try
+        {
+            await instanceRepository.SaveAsync(instance);
+
+            var publishMessage = await outboxStore.SaveMessageAsync(
+                new WorkflowOutboxMessageDraft(
+                    instance.Id,
+                    "workflow.publish-fenced",
+                    "workflow.events",
+                    """{"state":"pending"}""",
+                    CreatedAtUtc: nowUtc.AddMinutes(-10),
+                    NextAttemptAtUtc: nowUtc.AddMinutes(-10)));
+            var failMessage = await outboxStore.SaveMessageAsync(
+                new WorkflowOutboxMessageDraft(
+                    instance.Id,
+                    "workflow.fail-fenced",
+                    "workflow.events",
+                    """{"state":"pending"}""",
+                    CreatedAtUtc: nowUtc.AddMinutes(-9),
+                    NextAttemptAtUtc: nowUtc.AddMinutes(-9)));
+            var messageIds = new HashSet<Guid>
+            {
+                publishMessage.Id,
+                failMessage.Id
+            };
+
+            var firstClaim = await outboxStore.ClaimPendingMessagesAsync(
+                nowUtc,
+                "stale-publisher",
+                TimeSpan.FromSeconds(1),
+                batchSize: 50);
+
+            Assert.Contains(firstClaim, message => message.Id == publishMessage.Id);
+            Assert.Contains(firstClaim, message => message.Id == failMessage.Id);
+
+            var secondClaim = await outboxStore.ClaimPendingMessagesAsync(
+                nowUtc.AddSeconds(2),
+                "current-publisher",
+                TimeSpan.FromMinutes(5),
+                batchSize: 50);
+
+            Assert.Contains(secondClaim, message => message.Id == publishMessage.Id);
+            Assert.Contains(secondClaim, message => message.Id == failMessage.Id);
+
+            var stalePublished = await outboxStore.MarkMessagePublishedAsync(
+                publishMessage.Id,
+                "stale-publisher",
+                nowUtc.AddSeconds(3));
+            var staleFailed = await outboxStore.MarkMessageFailedAsync(
+                failMessage.Id,
+                "stale-publisher",
+                "stale publisher should not win",
+                nowUtc.AddSeconds(3),
+                nowUtc.AddMinutes(5));
+
+            Assert.False(stalePublished);
+            Assert.False(staleFailed);
+
+            var afterStaleCompletion = (await outboxStore.GetMessagesForWorkflowAsync(instance.Id))
+                .Where(message => messageIds.Contains(message.Id))
+                .ToArray();
+
+            Assert.Collection(
+                afterStaleCompletion.OrderBy(message => message.MessageType),
+                message =>
+                {
+                    Assert.Equal(failMessage.Id, message.Id);
+                    Assert.Equal(WorkflowOutboxStatus.Pending, message.Status);
+                    Assert.Equal(0, message.RetryCount);
+                    Assert.Null(message.ErrorMessage);
+                    Assert.Null(message.PublishedAtUtc);
+                    Assert.Equal("current-publisher", message.LeaseOwner);
+                    Assert.NotNull(message.LeaseUntilUtc);
+                },
+                message =>
+                {
+                    Assert.Equal(publishMessage.Id, message.Id);
+                    Assert.Equal(WorkflowOutboxStatus.Pending, message.Status);
+                    Assert.Equal(0, message.RetryCount);
+                    Assert.Null(message.ErrorMessage);
+                    Assert.Null(message.PublishedAtUtc);
+                    Assert.Equal("current-publisher", message.LeaseOwner);
+                    Assert.NotNull(message.LeaseUntilUtc);
+                });
+
+            var currentPublished = await outboxStore.MarkMessagePublishedAsync(
+                publishMessage.Id,
+                "current-publisher",
+                nowUtc.AddSeconds(4));
+            var currentFailed = await outboxStore.MarkMessageFailedAsync(
+                failMessage.Id,
+                "current-publisher",
+                "current publisher failure",
+                nowUtc.AddSeconds(4),
+                nextAttemptAtUtc: null);
+
+            Assert.True(currentPublished);
+            Assert.True(currentFailed);
+
+            var afterCurrentCompletion = (await outboxStore.GetMessagesForWorkflowAsync(instance.Id))
+                .Where(message => messageIds.Contains(message.Id))
+                .ToArray();
+
+            var published = Assert.Single(
+                afterCurrentCompletion,
+                message => message.Id == publishMessage.Id);
+            Assert.Equal(WorkflowOutboxStatus.Published, published.Status);
+            Assert.NotNull(published.PublishedAtUtc);
+            Assert.Null(published.LeaseOwner);
+            Assert.Null(published.LeaseUntilUtc);
+
+            var failed = Assert.Single(
+                afterCurrentCompletion,
+                message => message.Id == failMessage.Id);
+            Assert.Equal(WorkflowOutboxStatus.Failed, failed.Status);
+            Assert.Equal(1, failed.RetryCount);
+            Assert.Equal("current publisher failure", failed.ErrorMessage);
+            Assert.Null(failed.LeaseOwner);
+            Assert.Null(failed.LeaseUntilUtc);
         }
         finally
         {
