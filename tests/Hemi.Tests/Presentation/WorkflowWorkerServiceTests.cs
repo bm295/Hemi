@@ -11,7 +11,7 @@ namespace Hemi.Tests.Presentation;
 public sealed class WorkflowWorkerServiceTests
 {
     [Fact]
-    public async Task Worker_hydrates_context_from_payload_and_finalizes_terminal_state()
+    public async Task Worker_hydrates_context_from_payload_and_delegates_lifecycle_state_to_dispatcher()
     {
         var instance = CreateInstance(
             attempt: 1,
@@ -28,8 +28,7 @@ public sealed class WorkflowWorkerServiceTests
         using var services = CreateServices(dispatcher);
         using var worker = CreateWorker(
             services,
-            store,
-            WorkflowPolicies.NoRetry);
+            store);
 
         await worker.StartAsync(CancellationToken.None);
 
@@ -39,59 +38,77 @@ public sealed class WorkflowWorkerServiceTests
         Assert.True(context.Items.TryGetValue("marker", out var marker));
         var markerJson = Assert.IsType<JsonElement>(marker);
         Assert.Equal("from-payload", markerJson.GetString());
-        Assert.Equal(WorkflowState.Succeeded, store.State);
-        Assert.Equal(instance.Version + 1, store.StateExpectedVersion);
+        Assert.Null(store.State);
+        Assert.Null(store.StateExpectedVersion);
         Assert.Null(store.NextAttemptAtUtc);
-        Assert.NotNull(store.CompletedAtUtc);
-        Assert.Contains(@"""processed"":true", store.PayloadJson, StringComparison.Ordinal);
+        Assert.Null(store.CompletedAtUtc);
+        Assert.DoesNotContain(@"""processed"":true", store.PayloadJson, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task Worker_schedules_retry_for_failed_eligible_attempt()
+    public async Task Worker_marks_non_terminal_dispatch_failure_failed()
     {
         var instance = CreateInstance(
             attempt: 1,
             version: 4,
             payloadJson: """{"marker":"retry"}""");
         var store = new PollingWorkflowInstanceStore(instance);
-        var dispatcher = new RecordingDispatcher(context =>
-        {
-            context.State = WorkflowState.Failed;
-            throw new InvalidOperationException("temporary workflow failure");
-        });
-        var policies = new WorkflowPolicies(
-            maxRetryAttempts: 2,
-            retryDelay: TimeSpan.FromMilliseconds(10),
-            enableCompensation: false,
-            stopOnFirstFailure: true,
-            timeout: TimeSpan.FromSeconds(30));
+        var dispatcher = new RecordingDispatcher(_ =>
+            throw new InvalidOperationException("temporary workflow failure"));
 
         using var services = CreateServices(dispatcher);
         using var worker = CreateWorker(
             services,
-            store,
-            policies);
+            store);
 
         await worker.StartAsync(CancellationToken.None);
 
         _ = await store.StateUpdated.Task.WaitAsync(TimeSpan.FromSeconds(5));
         await worker.StopAsync(CancellationToken.None);
 
-        Assert.Equal(WorkflowState.Pending, store.State);
+        Assert.Equal(WorkflowState.Failed, store.State);
         Assert.Equal("temporary workflow failure", store.LastError);
-        Assert.Null(store.CompletedAtUtc);
-        Assert.NotNull(store.NextAttemptAtUtc);
+        Assert.NotNull(store.CompletedAtUtc);
+        Assert.Null(store.NextAttemptAtUtc);
         Assert.Equal(instance.Version + 1, store.StateExpectedVersion);
+    }
+
+    [Fact]
+    public async Task Worker_does_not_overwrite_terminal_dispatch_failure_with_pending()
+    {
+        var instance = CreateInstance(
+            attempt: 1,
+            version: 4,
+            payloadJson: """{"marker":"compensated"}""");
+        var store = new PollingWorkflowInstanceStore(instance);
+        var dispatcher = new RecordingDispatcher(context =>
+        {
+            context.State = WorkflowState.Compensated;
+            throw new InvalidOperationException("workflow already compensated");
+        });
+
+        using var services = CreateServices(dispatcher);
+        using var worker = CreateWorker(
+            services,
+            store);
+
+        await worker.StartAsync(CancellationToken.None);
+
+        _ = await dispatcher.Handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await worker.StopAsync(CancellationToken.None);
+
+        Assert.Null(store.State);
+        Assert.Null(store.LastError);
+        Assert.Null(store.CompletedAtUtc);
+        Assert.Null(store.NextAttemptAtUtc);
     }
 
     private static WorkflowWorkerService CreateWorker(
         ServiceProvider services,
-        IWorkflowInstanceStore store,
-        WorkflowPolicies policies) =>
+        IWorkflowInstanceStore store) =>
         new(
             services.GetRequiredService<IServiceScopeFactory>(),
             store,
-            new StaticRetryPolicyProvider(policies),
             NullLogger<WorkflowWorkerService>.Instance);
 
     private static ServiceProvider CreateServices(
@@ -150,13 +167,6 @@ public sealed class WorkflowWorkerServiceTests
                 throw;
             }
         }
-    }
-
-    private sealed class StaticRetryPolicyProvider(
-        WorkflowPolicies policies)
-        : IRetryPolicyProvider
-    {
-        public WorkflowPolicies GetPolicy(string workflowId) => policies;
     }
 
     private sealed class PollingWorkflowInstanceStore(

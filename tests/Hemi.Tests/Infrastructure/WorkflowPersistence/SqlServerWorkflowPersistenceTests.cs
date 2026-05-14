@@ -575,6 +575,54 @@ public sealed class SqlServerWorkflowPersistenceTests
     }
 
     [SqlServerFact]
+    public async Task Terminal_workflows_cannot_be_reset_to_pending_or_claimed()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var repository = new WorkflowInstanceRepository(database.ConnectionString);
+        var instances = new[]
+        {
+            CreateTerminalInstance(WorkflowState.Succeeded),
+            CreateTerminalInstance(WorkflowState.Failed),
+            CreateTerminalInstance(WorkflowState.Compensated),
+            CreateTerminalInstance(WorkflowState.CompensationFailed),
+            CreateTerminalInstance(WorkflowState.Cancelled)
+        };
+
+        try
+        {
+            foreach (var instance in instances)
+            {
+                await repository.SaveAsync(instance);
+
+                var reset = await repository.TryUpdateStateAsync(
+                    instance.Id,
+                    WorkflowState.Pending,
+                    instance.Version,
+                    nextAttemptAtUtc: DateTimeOffset.UtcNow.AddSeconds(-1));
+
+                Assert.False(reset);
+            }
+
+            var claimed = await repository.ClaimDueInstancesAsync(
+                DateTimeOffset.UtcNow,
+                "terminal-state-worker",
+                TimeSpan.FromMinutes(5),
+                batchSize: instances.Length);
+
+            Assert.DoesNotContain(
+                claimed,
+                claimedInstance => instances.Any(instance => instance.Id == claimedInstance.Id));
+        }
+        finally
+        {
+            foreach (var instance in instances)
+            {
+                await database.DeleteWorkflowInstanceAsync(instance.Id);
+            }
+        }
+    }
+
+    [SqlServerFact]
     public async Task Workflow_context_payload_is_persisted_after_each_engine_step()
     {
         await using var database = await WorkflowSqlTestDatabase.CreateAsync();
@@ -978,6 +1026,20 @@ public sealed class SqlServerWorkflowPersistenceTests
             "sql-tests",
             DateTimeOffset.UtcNow.AddSeconds(-5),
             NextAttemptAtUtc: DateTimeOffset.UtcNow.AddSeconds(-5));
+
+    private static WorkflowInstanceEntity CreateTerminalInstance(
+        WorkflowState state) =>
+        new()
+        {
+            Id = Guid.NewGuid(),
+            CommandId = Guid.NewGuid(),
+            WorkflowId = WorkflowIds.OrderFulfillment,
+            WorkflowName = "Order Fulfillment",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = state,
+            PayloadJson = """{"source":"terminal-state-test"}""",
+            CompletedAtUtc = DateTimeOffset.UtcNow.AddSeconds(-1)
+        };
 
     private static WorkflowEngine CreateSqlTestEngine(
         IServiceCollection services,

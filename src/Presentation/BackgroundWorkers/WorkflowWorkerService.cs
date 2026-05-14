@@ -11,7 +11,6 @@ namespace Hemi.Presentation.BackgroundWorkers;
 public sealed class WorkflowWorkerService(
     IServiceScopeFactory serviceScopeFactory,
     IWorkflowInstanceStore workflowInstanceStore,
-    IRetryPolicyProvider retryPolicyProvider,
     ILogger<WorkflowWorkerService> logger,
     WorkflowMetrics? workflowMetrics = null,
     WorkflowTracing? workflowTracing = null)
@@ -116,29 +115,6 @@ public sealed class WorkflowWorkerService(
                 context,
                 cancellationToken);
 
-            var version = await PersistContextPayloadAsync(
-                instance,
-                context,
-                cancellationToken);
-            var completedAtUtc = DateTimeOffset.UtcNow;
-            var finalState = IsTerminal(context.State)
-                ? context.State
-                : WorkflowState.Succeeded;
-
-            if (!await workflowInstanceStore.TryUpdateStateAsync(
-                    instance.Id,
-                    finalState,
-                    version,
-                    lastError: null,
-                    completedAtUtc: completedAtUtc,
-                    nextAttemptAtUtc: null,
-                    cancellationToken))
-            {
-                logger.LogWarning(
-                    "Workflow instance {WorkflowInstanceId} final state update lost optimistic concurrency.",
-                    instance.Id);
-            }
-
             workflowMetrics?.RecordCommandCompleted(
                 command,
                 stopwatch.Elapsed);
@@ -170,40 +146,19 @@ public sealed class WorkflowWorkerService(
         Exception exception,
         CancellationToken cancellationToken)
     {
-        var policies = retryPolicyProvider.GetPolicy(instance.WorkflowId);
+        if (IsTerminal(context.State))
+        {
+            return;
+        }
+
         var version = await PersistContextPayloadAsync(
             instance,
             context,
             cancellationToken);
 
-        if (IsRetryEligible(instance, context, policies))
-        {
-            var nextAttemptAtUtc = DateTimeOffset.UtcNow.Add(policies.RetryDelay);
-
-            if (!await workflowInstanceStore.TryUpdateStateAsync(
-                    instance.Id,
-                    WorkflowState.Pending,
-                    version,
-                    lastError: exception.Message,
-                    completedAtUtc: null,
-                    nextAttemptAtUtc: nextAttemptAtUtc,
-                    cancellationToken))
-            {
-                logger.LogWarning(
-                    "Workflow instance {WorkflowInstanceId} retry scheduling lost optimistic concurrency.",
-                    instance.Id);
-            }
-
-            return;
-        }
-
-        var terminalState = IsTerminal(context.State)
-            ? context.State
-            : WorkflowState.Failed;
-
         if (!await workflowInstanceStore.TryUpdateStateAsync(
                 instance.Id,
-                terminalState,
+                WorkflowState.Failed,
                 version,
                 lastError: exception.Message,
                 completedAtUtc: DateTimeOffset.UtcNow,
@@ -314,13 +269,6 @@ public sealed class WorkflowWorkerService(
             instance.CreatedAtUtc,
             instance.IdempotencyKey,
             instance.RequestedBy);
-
-    private static bool IsRetryEligible(
-        WorkflowInstanceRecord instance,
-        WorkflowContext context,
-        WorkflowPolicies policies) =>
-        context.State != WorkflowState.Cancelled &&
-        instance.Attempt <= policies.MaxRetryAttempts;
 
     private static bool IsTerminal(WorkflowState state) =>
         state is WorkflowState.Succeeded

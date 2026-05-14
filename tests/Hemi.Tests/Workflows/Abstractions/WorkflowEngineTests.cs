@@ -94,7 +94,46 @@ public sealed class WorkflowEngineTests
             ["running:1:2", "succeeded:1:2", "running:2:2", "succeeded:2:2"],
             logStore.Transitions);
         Assert.Equal(2, instanceStore.Payloads.Count);
-        Assert.Equal(3, context.WorkflowInstanceVersion);
+        Assert.Contains(WorkflowState.Succeeded, instanceStore.States);
+        Assert.Equal(4, context.WorkflowInstanceVersion);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_persists_success_before_publishing_succeeded_event()
+    {
+        var services = new ServiceCollection();
+        var instanceStore = new RecordingWorkflowInstanceStore();
+        var logStore = new RecordingWorkflowExecutionLogStore();
+        services.AddSingleton(new StepRecorder());
+        services.AddSingleton<IWorkflowInstanceStore>(instanceStore);
+        services.AddSingleton<IWorkflowExecutionLogStore>(logStore);
+        services.AddTransient<FirstStep>();
+
+        var publisher = new RecordingWorkflowEventPublisher(workflowEvent =>
+        {
+            if (workflowEvent.EventName == WorkflowEvents.WorkflowSucceeded)
+            {
+                Assert.Contains(WorkflowState.Succeeded, instanceStore.States);
+            }
+        });
+        var engine = CreateEngine(services, publisher);
+        var context = new WorkflowContext("test-workflow", "correlation-success")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 1,
+            WorkflowAttempt = 1,
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FirstStep));
+
+        await engine.ExecuteAsync("test-workflow", definition, context);
+
+        Assert.Equal(WorkflowState.Succeeded, instanceStore.States.Last());
+        Assert.Contains(
+            publisher.Events,
+            workflowEvent => workflowEvent.EventName == WorkflowEvents.WorkflowSucceeded);
     }
 
     [Fact]
@@ -496,7 +535,8 @@ public sealed class WorkflowEngineTests
         }
     }
 
-    private sealed class RecordingWorkflowEventPublisher
+    private sealed class RecordingWorkflowEventPublisher(
+        Action<WorkflowEvent>? onPublish = null)
         : IWorkflowEventPublisher
     {
         public List<WorkflowEvent> Events { get; } = [];
@@ -505,6 +545,7 @@ public sealed class WorkflowEngineTests
             WorkflowEvent workflowEvent,
             CancellationToken cancellationToken = default)
         {
+            onPublish?.Invoke(workflowEvent);
             Events.Add(workflowEvent);
             return Task.CompletedTask;
         }

@@ -359,12 +359,35 @@ public sealed class WorkflowInstanceRepository(string connectionString)
                 NextAttemptAtUtc = @NextAttemptAtUtc,
                 LeaseOwner = CASE WHEN @ClearLease = 1 THEN NULL ELSE LeaseOwner END,
                 LeaseUntilUtc = CASE WHEN @ClearLease = 1 THEN NULL ELSE LeaseUntilUtc END
-            WHERE Id = @Id AND Version = @ExpectedVersion;
+            WHERE Id = @Id
+              AND Version = @ExpectedVersion
+              AND NOT (
+                  @State = @PendingState
+                  AND State IN (
+                      @SucceededState,
+                      @FailedState,
+                      @CompensatedState,
+                      @CompensationFailedState,
+                      @CancelledState
+                  )
+              );
             """;
 
         await using var command = new SqlCommand(sql, connection);
         _ = command.Parameters.Add("@Id", SqlDbType.UniqueIdentifier).Value = id;
         _ = command.Parameters.Add("@State", SqlDbType.NVarChar, 32).Value = state.ToString();
+        _ = command.Parameters.Add("@PendingState", SqlDbType.NVarChar, 32).Value =
+            WorkflowState.Pending.ToString();
+        _ = command.Parameters.Add("@SucceededState", SqlDbType.NVarChar, 32).Value =
+            WorkflowState.Succeeded.ToString();
+        _ = command.Parameters.Add("@FailedState", SqlDbType.NVarChar, 32).Value =
+            WorkflowState.Failed.ToString();
+        _ = command.Parameters.Add("@CompensatedState", SqlDbType.NVarChar, 32).Value =
+            WorkflowState.Compensated.ToString();
+        _ = command.Parameters.Add("@CompensationFailedState", SqlDbType.NVarChar, 32).Value =
+            WorkflowState.CompensationFailed.ToString();
+        _ = command.Parameters.Add("@CancelledState", SqlDbType.NVarChar, 32).Value =
+            WorkflowState.Cancelled.ToString();
         AddNullable(command, "@LastError", SqlDbType.NVarChar, 1024, lastError);
         _ = command.Parameters.Add("@ExpectedVersion", SqlDbType.Int).Value = expectedVersion;
         _ = command.Parameters.Add("@UpdatedAtUtc", SqlDbType.DateTimeOffset).Value =

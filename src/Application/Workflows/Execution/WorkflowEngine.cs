@@ -167,6 +167,13 @@ public sealed class WorkflowEngine : IWorkflowEngine
 
             context.State = WorkflowState.Succeeded;
 
+            await PersistWorkflowStateAsync(
+                context,
+                WorkflowState.Succeeded,
+                error: null,
+                completedAtUtc: DateTimeOffset.UtcNow,
+                CancellationToken.None);
+
             await PublishAsync(
                 WorkflowEvents.WorkflowSucceeded,
                 workflowId,
@@ -213,6 +220,11 @@ public sealed class WorkflowEngine : IWorkflowEngine
         }
         catch (Exception ex)
         {
+            if (IsTerminal(context.State))
+            {
+                throw;
+            }
+
             context.LastError = ex;
             context.State =
                 ex is OperationCanceledException &&
@@ -304,25 +316,26 @@ public sealed class WorkflowEngine : IWorkflowEngine
         CancellationToken cancellationToken)
     {
         context.State = WorkflowState.Compensating;
-
-        await PersistWorkflowStateAsync(
-            context,
-            WorkflowState.Compensating,
-            error: null,
-            completedAtUtc: null,
-            cancellationToken);
-
-        await PublishAsync(
-            WorkflowEvents.CompensationStarted,
-            workflowId,
-            workflowDefinition,
-            context,
-            stepType: null,
-            error: null,
-            CancellationToken.None);
+        var terminalStatePersisted = false;
 
         try
         {
+            await PersistWorkflowStateAsync(
+                context,
+                WorkflowState.Compensating,
+                error: null,
+                completedAtUtc: null,
+                cancellationToken);
+
+            await PublishAsync(
+                WorkflowEvents.CompensationStarted,
+                workflowId,
+                workflowDefinition,
+                context,
+                stepType: null,
+                error: null,
+                CancellationToken.None);
+
             while (compensationSteps.Count > 0)
             {
                 var compensationStep = compensationSteps.Pop();
@@ -363,6 +376,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
                         ex,
                         DateTimeOffset.UtcNow,
                         CancellationToken.None);
+                    terminalStatePersisted = true;
 
                     await PublishAsync(
                         WorkflowEvents.CompensationFailed,
@@ -385,6 +399,7 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 error: null,
                 completedAtUtc: DateTimeOffset.UtcNow,
                 CancellationToken.None);
+            terminalStatePersisted = true;
 
             await PublishAsync(
                 WorkflowEvents.CompensationCompleted,
@@ -397,8 +412,21 @@ public sealed class WorkflowEngine : IWorkflowEngine
         }
         catch (Exception ex)
         {
+            if (terminalStatePersisted && IsTerminal(context.State))
+            {
+                throw;
+            }
+
             context.LastError = ex;
             context.State = WorkflowState.CompensationFailed;
+
+            await PersistWorkflowStateAsync(
+                context,
+                WorkflowState.CompensationFailed,
+                ex,
+                DateTimeOffset.UtcNow,
+                CancellationToken.None);
+
             throw;
         }
     }
