@@ -89,45 +89,14 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 }
 
                 var step = ResolveStep(indexedStep.Type);
-                var stepAttempt = GetWorkflowAttempt(context);
-
-                await JournalStepRunningAsync(
+                var stepAttempt = await ExecuteStepWithRetryAsync(
+                    step,
                     context,
-                    indexedStep,
-                    stepAttempt,
-                    workflowId,
-                    workflowDefinition,
-                    executionToken);
-
-                try
-                {
-                    await ExecuteWithRetryAsync(
-                        step,
-                        context,
-                        policies,
-                        executionToken);
-                }
-                catch (Exception ex)
-                {
-                    await JournalStepFailedAsync(
-                        context,
-                        workflowId,
-                        workflowDefinition,
-                        indexedStep,
-                        indexedStep.Order,
-                        stepAttempt,
-                        ex,
-                        CancellationToken.None);
-
-                    throw;
-                }
-
-                await JournalStepSucceededAsync(
-                    context,
+                    policies,
                     workflowId,
                     workflowDefinition,
                     indexedStep,
-                    stepAttempt,
+                    GetNextStepAttempt(persistedAttempts, indexedStep.Order),
                     executionToken);
 
                 if (step is ICompensableWorkflowStep<WorkflowContext> compensableStep)
@@ -235,35 +204,70 @@ public sealed class WorkflowEngine : IWorkflowEngine
         return workflowStep;
     }
 
-    private static async Task ExecuteWithRetryAsync(
+    private async Task<int> ExecuteStepWithRetryAsync(
         IWorkflowStep<WorkflowContext> step,
         WorkflowContext context,
         WorkflowPolicies policies,
+        string workflowId,
+        IWorkflowDefinition workflowDefinition,
+        IndexedStep indexedStep,
+        int firstStepAttempt,
         CancellationToken cancellationToken)
     {
-        var attempt = 0;
+        var retryAttempt = 0;
+        var stepAttempt = firstStepAttempt;
 
         while (true)
         {
+            await JournalStepRunningAsync(
+                context,
+                indexedStep,
+                stepAttempt,
+                workflowId,
+                workflowDefinition,
+                cancellationToken);
+
             try
             {
                 await step.ExecuteAsync(context, cancellationToken);
-                return;
             }
-            catch
+            catch (Exception ex)
             {
-                if (attempt >= policies.MaxRetryAttempts)
+                await JournalStepFailedAsync(
+                    context,
+                    workflowId,
+                    workflowDefinition,
+                    indexedStep,
+                    indexedStep.Order,
+                    stepAttempt,
+                    ex,
+                    CancellationToken.None);
+
+                if (retryAttempt >= policies.MaxRetryAttempts)
                 {
                     throw;
                 }
 
-                attempt++;
+                retryAttempt++;
+                stepAttempt++;
 
                 if (policies.RetryDelay > TimeSpan.Zero)
                 {
                     await Task.Delay(policies.RetryDelay, cancellationToken);
                 }
+
+                continue;
             }
+
+            await JournalStepSucceededAsync(
+                context,
+                workflowId,
+                workflowDefinition,
+                indexedStep,
+                stepAttempt,
+                cancellationToken);
+
+            return stepAttempt;
         }
     }
 
@@ -1128,10 +1132,14 @@ public sealed class WorkflowEngine : IWorkflowEngine
                 index + 1,
                 stepType));
 
-    private static int GetWorkflowAttempt(WorkflowContext context) =>
-        context.WorkflowAttempt > 0
-            ? context.WorkflowAttempt
-            : 1;
+    private static int GetNextStepAttempt(
+        IEnumerable<WorkflowStepAttemptRecord> attempts,
+        int stepOrder) =>
+        attempts
+            .Where(attempt => attempt.StepOrder == stepOrder)
+            .Select(attempt => attempt.Attempt)
+            .DefaultIfEmpty(0)
+            .Max() + 1;
 
     private static bool IsTerminal(WorkflowState state) =>
         state is WorkflowState.Succeeded

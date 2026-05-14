@@ -91,7 +91,7 @@ public sealed class WorkflowEngineTests
 
         Assert.Equal(["first", "second"], recorder.Executed);
         Assert.Equal(
-            ["running:1:2", "succeeded:1:2", "running:2:2", "succeeded:2:2"],
+            ["running:1:1", "succeeded:1:1", "running:2:1", "succeeded:2:1"],
             logStore.Transitions);
         Assert.Equal(2, instanceStore.Payloads.Count);
         Assert.Contains(WorkflowState.Succeeded, instanceStore.States);
@@ -207,8 +207,50 @@ public sealed class WorkflowEngineTests
 
         Assert.Equal("Step failed.", exception.Message);
         Assert.Equal(WorkflowState.Compensated, context.State);
-        Assert.Equal(["running:1:3", "failed:1:3"], logStore.Transitions);
+        Assert.Equal(["running:1:1", "failed:1:1"], logStore.Transitions);
         Assert.Contains(WorkflowState.Failed, instanceStore.States);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_records_each_internal_step_retry_as_separate_attempt()
+    {
+        var services = new ServiceCollection();
+        var recorder = new StepRecorder();
+        var instanceStore = new RecordingWorkflowInstanceStore();
+        var logStore = new RecordingWorkflowExecutionLogStore();
+        services.AddSingleton(recorder);
+        services.AddSingleton<IWorkflowInstanceStore>(instanceStore);
+        services.AddSingleton<IWorkflowExecutionLogStore>(logStore);
+        services.AddTransient<FlakyStep>();
+
+        var retryPolicy = new WorkflowPolicies(
+            maxRetryAttempts: 1,
+            retryDelay: TimeSpan.FromMilliseconds(1),
+            enableCompensation: true,
+            stopOnFirstFailure: true,
+            timeout: TimeSpan.FromMinutes(5));
+        var engine = CreateEngine(
+            services,
+            new RecordingWorkflowEventPublisher(),
+            retryPolicy);
+        var context = new WorkflowContext("test-workflow", "correlation-retry")
+        {
+            WorkflowInstanceId = Guid.NewGuid(),
+            WorkflowInstanceVersion = 1,
+            WorkflowAttempt = 5,
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FlakyStep));
+
+        await engine.ExecuteAsync("test-workflow", definition, context);
+
+        Assert.Equal(["flaky-1", "flaky-2"], recorder.Executed);
+        Assert.Equal(
+            ["running:1:1", "failed:1:1", "running:1:2", "succeeded:1:2"],
+            logStore.Transitions);
+        Assert.Equal(WorkflowState.Succeeded, context.State);
     }
 
     [Fact]
@@ -252,8 +294,54 @@ public sealed class WorkflowEngineTests
         await engine.ExecuteAsync("test-workflow", definition, context);
 
         Assert.Equal(["second"], recorder.Executed);
-        Assert.Equal(["running:2:2", "succeeded:2:2"], logStore.Transitions);
+        Assert.Equal(["running:2:1", "succeeded:2:1"], logStore.Transitions);
         Assert.Equal(WorkflowState.Succeeded, context.State);
+    }
+
+    [Fact]
+    public async Task ExecuteAsync_continues_step_attempt_numbers_from_persisted_history()
+    {
+        var services = new ServiceCollection();
+        var recorder = new StepRecorder();
+        var workflowInstanceId = Guid.Parse("33333333-3333-3333-3333-333333333333");
+        var logStore = new RecordingWorkflowExecutionLogStore(
+        [
+            new WorkflowStepAttemptRecord(
+                Guid.NewGuid(),
+                workflowInstanceId,
+                nameof(SecondStep),
+                StepOrder: 2,
+                WorkflowStepAttemptStatus.Failed,
+                Attempt: 2,
+                CommandId: Guid.NewGuid(),
+                ErrorMessage: "previous failure",
+                StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-5),
+                CompletedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-4),
+                CompensatedAtUtc: null)
+        ]);
+        services.AddSingleton(recorder);
+        services.AddSingleton<IWorkflowExecutionLogStore>(logStore);
+        services.AddTransient<FirstStep>();
+        services.AddTransient<SecondStep>();
+
+        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var context = new WorkflowContext("test-workflow", "correlation-resume-failed")
+        {
+            WorkflowInstanceId = workflowInstanceId,
+            WorkflowInstanceVersion = 2,
+            WorkflowAttempt = 7,
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FirstStep),
+            typeof(SecondStep));
+
+        await engine.ExecuteAsync("test-workflow", definition, context);
+
+        Assert.Equal(["first", "second"], recorder.Executed);
+        Assert.Contains("running:2:3", logStore.Transitions);
+        Assert.Contains("succeeded:2:3", logStore.Transitions);
     }
 
     [Fact]
@@ -345,8 +433,8 @@ public sealed class WorkflowEngineTests
 
         Assert.Equal("Step failed.", exception.Message);
         Assert.Equal(["compensated"], recorder.Executed);
-        Assert.Contains("running:2:2", logStore.Transitions);
-        Assert.Contains("failed:2:2", logStore.Transitions);
+        Assert.Contains("running:2:1", logStore.Transitions);
+        Assert.Contains("failed:2:1", logStore.Transitions);
         Assert.Contains("compensated:1:1", logStore.Transitions);
         Assert.Contains(WorkflowState.Compensated, instanceStore.States);
         Assert.True(instanceStore.Payloads.Count >= 2);
@@ -354,14 +442,15 @@ public sealed class WorkflowEngineTests
 
     private static WorkflowEngine CreateEngine(
         IServiceCollection services,
-        IWorkflowEventPublisher eventPublisher)
+        IWorkflowEventPublisher eventPublisher,
+        WorkflowPolicies? policy = null)
     {
         var provider = services.BuildServiceProvider();
         var retryPolicyProvider = new RetryPolicyProvider(
         [
             new WorkflowPolicyRegistration(
                 "test-workflow",
-                WorkflowPolicies.NoRetry)
+                policy ?? WorkflowPolicies.NoRetry)
         ]);
 
         return new WorkflowEngine(
@@ -395,6 +484,27 @@ public sealed class WorkflowEngineTests
             CancellationToken cancellationToken = default)
         {
             recorder.Executed.Add("second");
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FlakyStep(StepRecorder recorder)
+        : IWorkflowStep<WorkflowContext>
+    {
+        private int _executions;
+
+        public Task ExecuteAsync(
+            WorkflowContext context,
+            CancellationToken cancellationToken = default)
+        {
+            _executions++;
+            recorder.Executed.Add($"flaky-{_executions}");
+
+            if (_executions == 1)
+            {
+                throw new InvalidOperationException("Transient step failure.");
+            }
+
             return Task.CompletedTask;
         }
     }

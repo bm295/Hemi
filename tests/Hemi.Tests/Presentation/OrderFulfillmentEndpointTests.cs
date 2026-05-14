@@ -287,8 +287,20 @@ public sealed class OrderFulfillmentEndpointTests(
             instance.Id,
             "CaptureOrderPaymentStep",
             StepOrder: 2,
-            WorkflowStepAttemptStatus.Succeeded,
+            WorkflowStepAttemptStatus.Failed,
             Attempt: 1,
+            instance.CommandId,
+            ErrorMessage: "Transient payment error.",
+            StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-5),
+            CompletedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-4),
+            CompensatedAtUtc: null));
+        logStore.AddAttempt(new WorkflowStepAttemptRecord(
+            Guid.NewGuid(),
+            instance.Id,
+            "CaptureOrderPaymentStep",
+            StepOrder: 2,
+            WorkflowStepAttemptStatus.Succeeded,
+            Attempt: 2,
             instance.CommandId,
             ErrorMessage: null,
             StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-3),
@@ -314,7 +326,7 @@ public sealed class OrderFulfillmentEndpointTests(
         Assert.Equal(2, step.GetProperty("order").GetInt32());
         Assert.Equal("CaptureOrderPaymentStep", step.GetProperty("name").GetString());
         Assert.Equal((int)WorkflowStepAttemptStatus.Succeeded, step.GetProperty("status").GetInt32());
-        Assert.Equal(1, step.GetProperty("attempt").GetInt32());
+        Assert.Equal(2, step.GetProperty("attempt").GetInt32());
     }
 
     [Fact]
