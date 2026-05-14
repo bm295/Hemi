@@ -164,7 +164,7 @@ public sealed class WorkflowOutboxPublisherTests
             DateTimeOffset nowUtc,
             string leaseOwner,
             TimeSpan leaseDuration,
-            int batchSize = 50,
+            int batchSize,
             CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyCollection<WorkflowOutboxMessageRecord>>(
                 Claim(nowUtc, leaseOwner, leaseDuration, batchSize));

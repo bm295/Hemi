@@ -47,7 +47,7 @@ public interface IWorkflowOutboxStore
         DateTimeOffset nowUtc,
         string leaseOwner,
         TimeSpan leaseDuration,
-        int batchSize = 50,
+        int batchSize,
         CancellationToken cancellationToken = default);
 
     Task MarkMessagePublishedAsync(

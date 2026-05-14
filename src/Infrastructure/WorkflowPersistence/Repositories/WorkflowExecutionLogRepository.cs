@@ -229,7 +229,7 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         DateTimeOffset nowUtc,
         string leaseOwner,
         TimeSpan leaseDuration,
-        int batchSize = 50,
+        int batchSize,
         CancellationToken cancellationToken = default)
     {
         var messages = await ClaimPendingOutboxMessagesAsync(
@@ -371,7 +371,7 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         DateTimeOffset nowUtc,
         string leaseOwner,
         TimeSpan leaseDuration,
-        int batchSize = 50,
+        int batchSize,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(leaseOwner))

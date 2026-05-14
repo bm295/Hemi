@@ -1010,7 +1010,8 @@ public sealed class SqlServerWorkflowPersistenceTests
             var pending = await outboxStore.ClaimPendingMessagesAsync(
                 DateTimeOffset.UtcNow,
                 "execution-log-test",
-                TimeSpan.FromMinutes(5));
+                TimeSpan.FromMinutes(5),
+                batchSize: 10);
 
             Assert.Contains(pending, pendingMessage => pendingMessage.Id == message.Id);
 
@@ -1232,7 +1233,8 @@ public sealed class SqlServerWorkflowPersistenceTests
             var pendingMessages = await logRepository.ClaimPendingOutboxMessagesAsync(
                 DateTimeOffset.UtcNow,
                 "log-repository-test",
-                TimeSpan.FromMinutes(5));
+                TimeSpan.FromMinutes(5),
+                batchSize: 50);
 
             Assert.Contains(
                 pendingMessages,
