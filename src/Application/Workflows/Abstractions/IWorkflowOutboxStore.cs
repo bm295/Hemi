@@ -50,13 +50,15 @@ public interface IWorkflowOutboxStore
         int batchSize,
         CancellationToken cancellationToken = default);
 
-    Task MarkMessagePublishedAsync(
+    Task<bool> MarkMessagePublishedAsync(
         Guid messageId,
+        string leaseOwner,
         DateTimeOffset publishedAtUtc,
         CancellationToken cancellationToken = default);
 
-    Task MarkMessageFailedAsync(
+    Task<bool> MarkMessageFailedAsync(
         Guid messageId,
+        string leaseOwner,
         string errorMessage,
         DateTimeOffset lastAttemptAtUtc,
         DateTimeOffset? nextAttemptAtUtc,

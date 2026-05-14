@@ -1012,11 +1012,20 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Equal("outbox-store-test", claimed.LeaseOwner);
             Assert.NotNull(claimed.LeaseUntilUtc);
 
-            await outboxStore.MarkMessageFailedAsync(
+            var stalePublished = await outboxStore.MarkMessagePublishedAsync(
                 message.Id,
+                "stale-outbox-store-test",
+                DateTimeOffset.UtcNow);
+            Assert.False(stalePublished);
+
+            var retryAtUtc = DateTimeOffset.UtcNow.AddMinutes(1);
+            var markedFailed = await outboxStore.MarkMessageFailedAsync(
+                message.Id,
+                "outbox-store-test",
                 "transport unavailable",
                 DateTimeOffset.UtcNow,
-                DateTimeOffset.UtcNow.AddMinutes(1));
+                retryAtUtc);
+            Assert.True(markedFailed);
 
             var retried = Assert.Single(
                 await outboxStore.GetMessagesForWorkflowAsync(instance.Id));
@@ -1029,9 +1038,18 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Null(retried.LeaseOwner);
             Assert.Null(retried.LeaseUntilUtc);
 
-            await outboxStore.MarkMessagePublishedAsync(
+            var retryClaim = await outboxStore.ClaimPendingMessagesAsync(
+                retryAtUtc.AddMilliseconds(1),
+                "outbox-store-test",
+                TimeSpan.FromMinutes(5),
+                batchSize: 10);
+            Assert.Contains(retryClaim, pendingMessage => pendingMessage.Id == message.Id);
+
+            var markedPublished = await outboxStore.MarkMessagePublishedAsync(
                 message.Id,
+                "outbox-store-test",
                 DateTimeOffset.UtcNow);
+            Assert.True(markedPublished);
 
             var published = Assert.Single(
                 await outboxStore.GetMessagesForWorkflowAsync(instance.Id));
@@ -1130,11 +1148,14 @@ public sealed class SqlServerWorkflowPersistenceTests
 
             Assert.Contains(pending, pendingMessage => pendingMessage.Id == message.Id);
 
-            await outboxStore.MarkMessageFailedAsync(
+            var nextAttemptAtUtc = DateTimeOffset.UtcNow.AddMinutes(5);
+            var markedFailed = await outboxStore.MarkMessageFailedAsync(
                 message.Id,
+                "execution-log-test",
                 "transient failure",
                 DateTimeOffset.UtcNow,
-                DateTimeOffset.UtcNow.AddMinutes(5));
+                nextAttemptAtUtc);
+            Assert.True(markedFailed);
 
             var afterFailure = Assert.Single(
                 await outboxStore.GetMessagesForWorkflowAsync(instance.Id));
@@ -1144,9 +1165,18 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Null(afterFailure.LeaseOwner);
             Assert.Null(afterFailure.LeaseUntilUtc);
 
-            await outboxStore.MarkMessagePublishedAsync(
+            var publishClaim = await outboxStore.ClaimPendingMessagesAsync(
+                nextAttemptAtUtc.AddMilliseconds(1),
+                "execution-log-test",
+                TimeSpan.FromMinutes(5),
+                batchSize: 10);
+            Assert.Contains(publishClaim, pendingMessage => pendingMessage.Id == message.Id);
+
+            var markedPublished = await outboxStore.MarkMessagePublishedAsync(
                 message.Id,
+                "execution-log-test",
                 DateTimeOffset.UtcNow);
+            Assert.True(markedPublished);
 
             var afterPublish = Assert.Single(
                 await outboxStore.GetMessagesForWorkflowAsync(instance.Id));
@@ -1430,11 +1460,14 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Equal("log-repository-test", claimedOutboxMessage.LeaseOwner);
             Assert.NotNull(claimedOutboxMessage.LeaseUntilUtc);
 
-            await logRepository.MarkOutboxMessageFailedAsync(
+            var nextAttemptAtUtc = DateTimeOffset.UtcNow.AddMinutes(5);
+            var markedFailed = await logRepository.MarkOutboxMessageFailedAsync(
                 outboxMessage.Id,
+                "log-repository-test",
                 "transient failure",
                 DateTimeOffset.UtcNow,
-                DateTimeOffset.UtcNow.AddMinutes(5));
+                nextAttemptAtUtc);
+            Assert.True(markedFailed);
 
             var failedMessages = await logRepository.GetOutboxMessagesAsync(instance.Id);
             var failedMessage = Assert.Single(failedMessages);
@@ -1444,9 +1477,18 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Null(failedMessage.LeaseOwner);
             Assert.Null(failedMessage.LeaseUntilUtc);
 
-            await logRepository.MarkOutboxMessagePublishedAsync(
+            var publishClaim = await logRepository.ClaimPendingOutboxMessagesAsync(
+                nextAttemptAtUtc.AddMilliseconds(1),
+                "log-repository-test",
+                TimeSpan.FromMinutes(5),
+                batchSize: 50);
+            Assert.Contains(publishClaim, message => message.Id == outboxMessage.Id);
+
+            var markedPublished = await logRepository.MarkOutboxMessagePublishedAsync(
                 outboxMessage.Id,
+                "log-repository-test",
                 DateTimeOffset.UtcNow);
+            Assert.True(markedPublished);
 
             var publishedMessages = await logRepository.GetOutboxMessagesAsync(instance.Id);
             var publishedMessage = Assert.Single(publishedMessages);

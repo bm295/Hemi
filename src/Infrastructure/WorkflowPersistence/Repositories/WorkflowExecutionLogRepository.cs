@@ -244,20 +244,27 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
             .ToArray();
     }
 
-    public Task MarkMessagePublishedAsync(
+    public Task<bool> MarkMessagePublishedAsync(
         Guid messageId,
+        string leaseOwner,
         DateTimeOffset publishedAtUtc,
         CancellationToken cancellationToken = default) =>
-        MarkOutboxMessagePublishedAsync(messageId, publishedAtUtc, cancellationToken);
+        MarkOutboxMessagePublishedAsync(
+            messageId,
+            leaseOwner,
+            publishedAtUtc,
+            cancellationToken);
 
-    public Task MarkMessageFailedAsync(
+    public Task<bool> MarkMessageFailedAsync(
         Guid messageId,
+        string leaseOwner,
         string errorMessage,
         DateTimeOffset lastAttemptAtUtc,
         DateTimeOffset? nextAttemptAtUtc,
         CancellationToken cancellationToken = default) =>
         MarkOutboxMessageFailedAsync(
             messageId,
+            leaseOwner,
             errorMessage,
             lastAttemptAtUtc,
             nextAttemptAtUtc,
@@ -501,11 +508,19 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         _ = await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    public async Task MarkOutboxMessagePublishedAsync(
+    public async Task<bool> MarkOutboxMessagePublishedAsync(
         Guid messageId,
+        string leaseOwner,
         DateTimeOffset publishedAtUtc,
         CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrWhiteSpace(leaseOwner))
+        {
+            throw new ArgumentException(
+                "Lease owner is required.",
+                nameof(leaseOwner));
+        }
+
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
 
@@ -518,26 +533,40 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
                 PublishedAtUtc = @PublishedAtUtc,
                 LeaseOwner = NULL,
                 LeaseUntilUtc = NULL
-            WHERE Id = @Id;
+            WHERE Id = @Id
+              AND Status = @PendingStatus
+              AND LeaseOwner = @LeaseOwner;
             """;
 
         await using var command = new SqlCommand(sql, connection);
         _ = command.Parameters.Add("@Id", SqlDbType.UniqueIdentifier).Value = messageId;
         _ = command.Parameters.Add("@Status", SqlDbType.NVarChar, 32).Value =
             WorkflowOutboxMessageStatus.Published.ToString();
+        _ = command.Parameters.Add("@PendingStatus", SqlDbType.NVarChar, 32).Value =
+            WorkflowOutboxMessageStatus.Pending.ToString();
+        _ = command.Parameters.Add("@LeaseOwner", SqlDbType.NVarChar, 128).Value =
+            leaseOwner;
         _ = command.Parameters.Add("@PublishedAtUtc", SqlDbType.DateTimeOffset).Value =
             publishedAtUtc;
 
-        _ = await command.ExecuteNonQueryAsync(cancellationToken);
+        return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
     }
 
-    public async Task MarkOutboxMessageFailedAsync(
+    public async Task<bool> MarkOutboxMessageFailedAsync(
         Guid messageId,
+        string leaseOwner,
         string errorMessage,
         DateTimeOffset lastAttemptAtUtc,
         DateTimeOffset? nextAttemptAtUtc,
         CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrWhiteSpace(leaseOwner))
+        {
+            throw new ArgumentException(
+                "Lease owner is required.",
+                nameof(leaseOwner));
+        }
+
         if (string.IsNullOrWhiteSpace(errorMessage))
         {
             throw new ArgumentException(
@@ -557,7 +586,9 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
                 NextAttemptAtUtc = @NextAttemptAtUtc,
                 LeaseOwner = NULL,
                 LeaseUntilUtc = NULL
-            WHERE Id = @Id;
+            WHERE Id = @Id
+              AND Status = @PendingStatus
+              AND LeaseOwner = @LeaseOwner;
             """;
 
         await using var command = new SqlCommand(sql, connection);
@@ -566,12 +597,16 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
             nextAttemptAtUtc.HasValue
                 ? WorkflowOutboxMessageStatus.Pending.ToString()
                 : WorkflowOutboxMessageStatus.Failed.ToString();
+        _ = command.Parameters.Add("@PendingStatus", SqlDbType.NVarChar, 32).Value =
+            WorkflowOutboxMessageStatus.Pending.ToString();
+        _ = command.Parameters.Add("@LeaseOwner", SqlDbType.NVarChar, 128).Value =
+            leaseOwner;
         AddNullable(command, "@ErrorMessage", SqlDbType.NVarChar, 1024, errorMessage);
         _ = command.Parameters.Add("@LastAttemptAtUtc", SqlDbType.DateTimeOffset).Value =
             lastAttemptAtUtc;
         AddNullable(command, "@NextAttemptAtUtc", SqlDbType.DateTimeOffset, nextAttemptAtUtc);
 
-        _ = await command.ExecuteNonQueryAsync(cancellationToken);
+        return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
     }
 
     private async Task<bool> MarkStepTerminalAsync(

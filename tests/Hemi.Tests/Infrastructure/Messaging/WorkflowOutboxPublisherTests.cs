@@ -139,6 +139,66 @@ public sealed class WorkflowOutboxPublisherTests
     }
 
     [Fact]
+    public async Task PublishPendingAsync_does_not_count_publish_when_completion_loses_lease()
+    {
+        var message = CreateOutboxMessage();
+        var outboxStore = new RecordingWorkflowOutboxStore([message]);
+        var transport = new RecordingWorkflowMessagePublisher(_ =>
+        {
+            outboxStore.ReassignLease(
+                message.Id,
+                "replacement-publisher",
+                DateTimeOffset.UtcNow.AddMinutes(5));
+            return Task.CompletedTask;
+        });
+        var publisher = new WorkflowOutboxPublisher(outboxStore, transport);
+
+        var publishedCount = await publisher.PublishPendingAsync(
+            batchSize: 10,
+            dueAtUtc: DateTimeOffset.UtcNow);
+
+        Assert.Equal(0, publishedCount);
+        Assert.Single(transport.PublishedMessages);
+        Assert.Empty(outboxStore.PublishedMessageIds);
+
+        var storedMessage = Assert.Single(outboxStore.Messages);
+        Assert.Equal(WorkflowOutboxStatus.Pending, storedMessage.Status);
+        Assert.Equal("replacement-publisher", storedMessage.LeaseOwner);
+        Assert.Null(storedMessage.PublishedAtUtc);
+    }
+
+    [Fact]
+    public async Task PublishPendingAsync_does_not_mark_failure_when_completion_loses_lease()
+    {
+        var message = CreateOutboxMessage();
+        var outboxStore = new RecordingWorkflowOutboxStore([message]);
+        var transport = new RecordingWorkflowMessagePublisher(_ =>
+        {
+            outboxStore.ReassignLease(
+                message.Id,
+                "replacement-publisher",
+                DateTimeOffset.UtcNow.AddMinutes(5));
+            throw new InvalidOperationException("transport unavailable");
+        });
+        var publisher = new WorkflowOutboxPublisher(outboxStore, transport);
+
+        var publishedCount = await publisher.PublishPendingAsync(
+            batchSize: 10,
+            dueAtUtc: DateTimeOffset.UtcNow,
+            maxRetryAttempts: 2,
+            retryDelay: TimeSpan.FromMinutes(1));
+
+        Assert.Equal(0, publishedCount);
+        Assert.Empty(outboxStore.FailedMessages);
+
+        var storedMessage = Assert.Single(outboxStore.Messages);
+        Assert.Equal(WorkflowOutboxStatus.Pending, storedMessage.Status);
+        Assert.Equal(message.RetryCount, storedMessage.RetryCount);
+        Assert.Null(storedMessage.ErrorMessage);
+        Assert.Equal("replacement-publisher", storedMessage.LeaseOwner);
+    }
+
+    [Fact]
     public async Task PublishPendingAsync_max_retry_exhaustion_marks_message_failed()
     {
         var message = CreateOutboxMessage(retryCount: 1);
@@ -297,13 +357,19 @@ public sealed class WorkflowOutboxPublisherTests
             }
         }
 
-        public Task MarkMessagePublishedAsync(
+        public Task<bool> MarkMessagePublishedAsync(
             Guid messageId,
+            string leaseOwner,
             DateTimeOffset publishedAtUtc,
             CancellationToken cancellationToken = default)
         {
             lock (_gate)
             {
+                if (!CanComplete(messageId, leaseOwner))
+                {
+                    return Task.FromResult(false);
+                }
+
                 PublishedMessageIds.Add(messageId);
                 UpdateMessage(messageId, message => message with
                 {
@@ -317,11 +383,12 @@ public sealed class WorkflowOutboxPublisherTests
                 });
             }
 
-            return Task.CompletedTask;
+            return Task.FromResult(true);
         }
 
-        public Task MarkMessageFailedAsync(
+        public Task<bool> MarkMessageFailedAsync(
             Guid messageId,
+            string leaseOwner,
             string errorMessage,
             DateTimeOffset lastAttemptAtUtc,
             DateTimeOffset? nextAttemptAtUtc,
@@ -329,6 +396,11 @@ public sealed class WorkflowOutboxPublisherTests
         {
             lock (_gate)
             {
+                if (!CanComplete(messageId, leaseOwner))
+                {
+                    return Task.FromResult(false);
+                }
+
                 FailedMessages.Add(new FailedOutboxMessage(
                     messageId,
                     errorMessage,
@@ -349,7 +421,35 @@ public sealed class WorkflowOutboxPublisherTests
                 });
             }
 
-            return Task.CompletedTask;
+            return Task.FromResult(true);
+        }
+
+        public void ReassignLease(
+            Guid messageId,
+            string leaseOwner,
+            DateTimeOffset leaseUntilUtc)
+        {
+            lock (_gate)
+            {
+                UpdateMessage(messageId, message => message with
+                {
+                    LeaseOwner = leaseOwner,
+                    LeaseUntilUtc = leaseUntilUtc
+                });
+            }
+        }
+
+        private bool CanComplete(
+            Guid messageId,
+            string leaseOwner)
+        {
+            var message = _messages.SingleOrDefault(message => message.Id == messageId);
+            return message is not null &&
+                message.Status == WorkflowOutboxStatus.Pending &&
+                string.Equals(
+                    message.LeaseOwner,
+                    leaseOwner,
+                    StringComparison.Ordinal);
         }
 
         private void UpdateMessage(

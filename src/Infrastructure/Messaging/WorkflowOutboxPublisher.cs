@@ -72,8 +72,9 @@ public sealed class WorkflowOutboxPublisher(
                     ? null
                     : failedAtUtc.Add(delay);
 
-                await outboxStore.MarkMessageFailedAsync(
+                _ = await outboxStore.MarkMessageFailedAsync(
                     message.Id,
+                    _leaseOwner,
                     ex.Message,
                     failedAtUtc,
                     nextAttemptAtUtc,
@@ -82,10 +83,16 @@ public sealed class WorkflowOutboxPublisher(
                 continue;
             }
 
-            await outboxStore.MarkMessagePublishedAsync(
+            var markedPublished = await outboxStore.MarkMessagePublishedAsync(
                 message.Id,
+                _leaseOwner,
                 DateTimeOffset.UtcNow,
                 cancellationToken);
+
+            if (!markedPublished)
+            {
+                continue;
+            }
 
             workflowMetrics?.RecordMessagePublished(
                 message.MessageType,
