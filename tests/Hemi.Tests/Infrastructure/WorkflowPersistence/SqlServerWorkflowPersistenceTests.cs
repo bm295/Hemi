@@ -1,13 +1,23 @@
 using System.Data;
+using System.Net;
+using System.Net.Http.Json;
 using System.Text;
+using System.Text.Json;
 using Hemi.Application.Workflows.Abstractions;
+using Hemi.Application.Workflows.Definitions.OrderFulfillment;
 using Hemi.Application.Workflows.Execution;
 using Hemi.Application.Workflows.Registry;
+using Hemi.Domain;
 using Hemi.Domain.Workflows;
 using Hemi.Infrastructure.WorkflowPersistence.Entities;
 using Hemi.Infrastructure.WorkflowPersistence.Repositories;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 
 namespace Hemi.Tests.Infrastructure.WorkflowPersistence;
 
@@ -47,6 +57,334 @@ public sealed class SqlServerWorkflowPersistenceTests
         Assert.Contains("UX_WorkflowStepExecution_Instance_Order_Attempt", indexes);
         Assert.Contains("IX_WorkflowOutboxMessage_Status_NextAttempt_CreatedAt", indexes);
         Assert.Contains("IX_WorkflowOutboxMessage_WorkflowInstanceId", indexes);
+    }
+
+    [SqlServerFact]
+    public async Task Post_fulfillment_saga_returns_accepted_after_sql_persistence()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        using var factory = new SqlWorkflowApiFactory(database.ConnectionString);
+        var client = factory.CreateClient();
+        var repository = new WorkflowInstanceRepository(database.ConnectionString);
+        WorkflowInstanceRecord? instance = null;
+        var orderId = Guid.NewGuid();
+        var idempotencyKey = $"endpoint-sql-{Guid.NewGuid():N}";
+
+        try
+        {
+            using var response = await PostFulfillmentSagaAsync(
+                client,
+                orderId,
+                idempotencyKey);
+
+            Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+            instance = await repository.GetInstanceByCorrelationAsync(
+                WorkflowIds.OrderFulfillment,
+                orderId.ToString("D"));
+
+            var persisted = instance
+                ?? throw new InvalidOperationException("Expected persisted workflow instance.");
+
+            using var payload = await ReadJsonAsync(response);
+            var root = payload.RootElement;
+
+            Assert.Equal(persisted.Id, root.GetProperty("workflowInstanceId").GetGuid());
+            Assert.Equal(persisted.CommandId, root.GetProperty("commandId").GetGuid());
+            Assert.Equal(WorkflowIds.OrderFulfillment, persisted.WorkflowId);
+            Assert.Equal(orderId.ToString("D"), persisted.CorrelationId);
+            Assert.Equal(WorkflowState.Pending, persisted.State);
+            Assert.Equal(idempotencyKey, persisted.IdempotencyKey);
+            Assert.Contains(
+                OrderFulfillmentWorkflowContext.OrderId,
+                persisted.PayloadJson,
+                StringComparison.Ordinal);
+        }
+        finally
+        {
+            if (instance is not null)
+            {
+                await database.DeleteWorkflowInstanceAsync(instance.Id);
+            }
+        }
+    }
+
+    [SqlServerFact]
+    public async Task Post_fulfillment_saga_repeating_same_request_returns_same_accepted_workflow()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        using var factory = new SqlWorkflowApiFactory(database.ConnectionString);
+        var client = factory.CreateClient();
+        var repository = new WorkflowInstanceRepository(database.ConnectionString);
+        WorkflowInstanceRecord? instance = null;
+        var orderId = Guid.NewGuid();
+        var idempotencyKey = $"endpoint-sql-{Guid.NewGuid():N}";
+
+        try
+        {
+            using var firstResponse = await PostFulfillmentSagaAsync(
+                client,
+                orderId,
+                idempotencyKey,
+                PaymentMethod.EWallet,
+                51.00m);
+            using var secondResponse = await PostFulfillmentSagaAsync(
+                client,
+                orderId,
+                idempotencyKey,
+                PaymentMethod.EWallet,
+                51.00m);
+
+            Assert.Equal(HttpStatusCode.Accepted, firstResponse.StatusCode);
+            Assert.Equal(HttpStatusCode.Accepted, secondResponse.StatusCode);
+
+            using var firstPayload = await ReadJsonAsync(firstResponse);
+            using var secondPayload = await ReadJsonAsync(secondResponse);
+            var firstRoot = firstPayload.RootElement;
+            var secondRoot = secondPayload.RootElement;
+
+            Assert.Equal(
+                firstRoot.GetProperty("workflowInstanceId").GetGuid(),
+                secondRoot.GetProperty("workflowInstanceId").GetGuid());
+            Assert.Equal(
+                firstRoot.GetProperty("commandId").GetGuid(),
+                secondRoot.GetProperty("commandId").GetGuid());
+            Assert.Equal(
+                firstRoot.GetProperty("acceptedAtUtc").GetDateTimeOffset(),
+                secondRoot.GetProperty("acceptedAtUtc").GetDateTimeOffset());
+
+            instance = await repository.GetInstanceByCorrelationAsync(
+                WorkflowIds.OrderFulfillment,
+                orderId.ToString("D"));
+
+            var persisted = instance
+                ?? throw new InvalidOperationException("Expected persisted workflow instance.");
+
+            Assert.Equal(
+                firstRoot.GetProperty("workflowInstanceId").GetGuid(),
+                persisted.Id);
+        }
+        finally
+        {
+            if (instance is not null)
+            {
+                await database.DeleteWorkflowInstanceAsync(instance.Id);
+            }
+        }
+    }
+
+    [SqlServerFact]
+    public async Task Post_fulfillment_saga_conflicting_idempotency_and_correlation_requests_return_conflict()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        using var factory = new SqlWorkflowApiFactory(database.ConnectionString);
+        var client = factory.CreateClient();
+        var createdInstanceIds = new List<Guid>();
+
+        try
+        {
+            var idempotencyKey = $"endpoint-sql-{Guid.NewGuid():N}";
+            using var idempotencySource = await PostFulfillmentSagaAsync(
+                client,
+                Guid.NewGuid(),
+                idempotencyKey);
+            Assert.Equal(HttpStatusCode.Accepted, idempotencySource.StatusCode);
+            createdInstanceIds.Add(await ReadWorkflowInstanceIdAsync(idempotencySource));
+
+            using var idempotencyConflict = await PostFulfillmentSagaAsync(
+                client,
+                Guid.NewGuid(),
+                idempotencyKey);
+
+            Assert.Equal(HttpStatusCode.Conflict, idempotencyConflict.StatusCode);
+            using var idempotencyPayload = await ReadJsonAsync(idempotencyConflict);
+            Assert.Equal(
+                "workflow.idempotency_conflict",
+                idempotencyPayload.RootElement.GetProperty("code").GetString());
+
+            var correlationOrderId = Guid.NewGuid();
+            using var correlationSource = await PostFulfillmentSagaAsync(
+                client,
+                correlationOrderId,
+                $"endpoint-sql-{Guid.NewGuid():N}");
+            Assert.Equal(HttpStatusCode.Accepted, correlationSource.StatusCode);
+            createdInstanceIds.Add(await ReadWorkflowInstanceIdAsync(correlationSource));
+
+            using var correlationConflict = await PostFulfillmentSagaAsync(
+                client,
+                correlationOrderId,
+                $"endpoint-sql-{Guid.NewGuid():N}");
+
+            Assert.Equal(HttpStatusCode.Conflict, correlationConflict.StatusCode);
+            using var correlationPayload = await ReadJsonAsync(correlationConflict);
+            Assert.Equal(
+                "workflow.correlation_conflict",
+                correlationPayload.RootElement.GetProperty("code").GetString());
+        }
+        finally
+        {
+            foreach (var instanceId in createdInstanceIds)
+            {
+                await database.DeleteWorkflowInstanceAsync(instanceId);
+            }
+        }
+    }
+
+    [SqlServerFact]
+    public async Task Get_fulfillment_saga_returns_sql_persisted_workflow_status()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        using var factory = new SqlWorkflowApiFactory(database.ConnectionString);
+        var client = factory.CreateClient();
+        var logRepository = new WorkflowExecutionLogRepository(database.ConnectionString);
+        Guid? instanceId = null;
+        var orderId = Guid.NewGuid();
+        var idempotencyKey = $"endpoint-sql-{Guid.NewGuid():N}";
+
+        try
+        {
+            using var startResponse = await PostFulfillmentSagaAsync(
+                client,
+                orderId,
+                idempotencyKey,
+                PaymentMethod.Card,
+                42.75m);
+
+            Assert.Equal(HttpStatusCode.Accepted, startResponse.StatusCode);
+            using var startPayload = await ReadJsonAsync(startResponse);
+            var startRoot = startPayload.RootElement;
+            instanceId = startRoot.GetProperty("workflowInstanceId").GetGuid();
+            var commandId = startRoot.GetProperty("commandId").GetGuid();
+
+            _ = await logRepository.MarkStepRunningAsync(
+                new WorkflowStepAttemptStart(
+                    instanceId.Value,
+                    "SendOrderToKitchenStep",
+                    StepOrder: 1,
+                    Attempt: 1,
+                    commandId,
+                    DateTimeOffset.UtcNow));
+
+            using var statusResponse = await client.GetAsync(
+                $"/orders/{orderId:D}/fulfillment-saga");
+
+            Assert.Equal(HttpStatusCode.OK, statusResponse.StatusCode);
+
+            using var statusPayload = await ReadJsonAsync(statusResponse);
+            var root = statusPayload.RootElement;
+
+            Assert.Equal(instanceId.Value, root.GetProperty("workflowInstanceId").GetGuid());
+            Assert.Equal(commandId, root.GetProperty("commandId").GetGuid());
+            Assert.Equal(WorkflowIds.OrderFulfillment, root.GetProperty("workflowId").GetString());
+            Assert.Equal(orderId.ToString("D"), root.GetProperty("correlationId").GetString());
+            Assert.Equal((int)WorkflowState.Pending, root.GetProperty("state").GetInt32());
+            Assert.Equal(idempotencyKey, root.GetProperty("idempotencyKey").GetString());
+            Assert.Equal(
+                orderId.ToString("D"),
+                root.GetProperty("items")
+                    .GetProperty(OrderFulfillmentWorkflowContext.OrderId)
+                    .GetString());
+
+            var step = Assert.Single(root.GetProperty("steps").EnumerateArray());
+            Assert.Equal(1, step.GetProperty("order").GetInt32());
+            Assert.Equal("SendOrderToKitchenStep", step.GetProperty("name").GetString());
+            Assert.Equal((int)WorkflowStepAttemptStatus.Running, step.GetProperty("status").GetInt32());
+        }
+        finally
+        {
+            if (instanceId.HasValue)
+            {
+                await database.DeleteWorkflowInstanceAsync(instanceId.Value);
+            }
+        }
+    }
+
+    [SqlServerFact]
+    public async Task Get_workflow_instance_returns_sql_step_summaries()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        using var factory = new SqlWorkflowApiFactory(database.ConnectionString);
+        var client = factory.CreateClient();
+        var logRepository = new WorkflowExecutionLogRepository(database.ConnectionString);
+        Guid? instanceId = null;
+        var orderId = Guid.NewGuid();
+
+        try
+        {
+            using var startResponse = await PostFulfillmentSagaAsync(
+                client,
+                orderId,
+                $"endpoint-sql-{Guid.NewGuid():N}");
+
+            Assert.Equal(HttpStatusCode.Accepted, startResponse.StatusCode);
+            using var startPayload = await ReadJsonAsync(startResponse);
+            var startRoot = startPayload.RootElement;
+            instanceId = startRoot.GetProperty("workflowInstanceId").GetGuid();
+            var commandId = startRoot.GetProperty("commandId").GetGuid();
+
+            _ = await logRepository.MarkStepRunningAsync(
+                new WorkflowStepAttemptStart(
+                    instanceId.Value,
+                    "CaptureOrderPaymentStep",
+                    StepOrder: 2,
+                    Attempt: 1,
+                    commandId,
+                    DateTimeOffset.UtcNow.AddSeconds(-4)));
+            _ = await logRepository.MarkStepFailedAsync(
+                instanceId.Value,
+                stepOrder: 2,
+                attempt: 1,
+                "Transient card gateway error.",
+                DateTimeOffset.UtcNow.AddSeconds(-3));
+            _ = await logRepository.MarkStepRunningAsync(
+                new WorkflowStepAttemptStart(
+                    instanceId.Value,
+                    "CaptureOrderPaymentStep",
+                    StepOrder: 2,
+                    Attempt: 2,
+                    commandId,
+                    DateTimeOffset.UtcNow.AddSeconds(-2)));
+            _ = await logRepository.MarkStepSucceededAsync(
+                instanceId.Value,
+                stepOrder: 2,
+                attempt: 2,
+                DateTimeOffset.UtcNow.AddSeconds(-1));
+            _ = await logRepository.MarkStepRunningAsync(
+                new WorkflowStepAttemptStart(
+                    instanceId.Value,
+                    "DeductOrderInventoryStep",
+                    StepOrder: 3,
+                    Attempt: 1,
+                    commandId,
+                    DateTimeOffset.UtcNow));
+
+            using var statusResponse = await client.GetAsync(
+                $"/workflows/{WorkflowIds.OrderFulfillment}/instances/{orderId:D}");
+
+            Assert.Equal(HttpStatusCode.OK, statusResponse.StatusCode);
+
+            using var statusPayload = await ReadJsonAsync(statusResponse);
+            var steps = statusPayload.RootElement.GetProperty("steps")
+                .EnumerateArray()
+                .ToArray();
+
+            Assert.Equal(2, steps.Length);
+            Assert.Equal(2, steps[0].GetProperty("order").GetInt32());
+            Assert.Equal("CaptureOrderPaymentStep", steps[0].GetProperty("name").GetString());
+            Assert.Equal((int)WorkflowStepAttemptStatus.Succeeded, steps[0].GetProperty("status").GetInt32());
+            Assert.Equal(2, steps[0].GetProperty("attempt").GetInt32());
+            Assert.Equal(3, steps[1].GetProperty("order").GetInt32());
+            Assert.Equal("DeductOrderInventoryStep", steps[1].GetProperty("name").GetString());
+            Assert.Equal((int)WorkflowStepAttemptStatus.Running, steps[1].GetProperty("status").GetInt32());
+            Assert.Equal(1, steps[1].GetProperty("attempt").GetInt32());
+        }
+        finally
+        {
+            if (instanceId.HasValue)
+            {
+                await database.DeleteWorkflowInstanceAsync(instanceId.Value);
+            }
+        }
     }
 
     [SqlServerFact]
@@ -658,6 +996,36 @@ public sealed class SqlServerWorkflowPersistenceTests
             retryPolicyProvider);
     }
 
+    private static Task<HttpResponseMessage> PostFulfillmentSagaAsync(
+        HttpClient client,
+        Guid orderId,
+        string idempotencyKey,
+        PaymentMethod method = PaymentMethod.Card,
+        decimal amount = 42.75m) =>
+        client.PostAsJsonAsync(
+            $"/orders/{orderId:D}/fulfillment-saga",
+            new
+            {
+                method,
+                amount,
+                idempotencyKey,
+                requestedBy = "sql-endpoint-tests"
+            });
+
+    private static async Task<Guid> ReadWorkflowInstanceIdAsync(
+        HttpResponseMessage response)
+    {
+        using var payload = await ReadJsonAsync(response);
+        return payload.RootElement.GetProperty("workflowInstanceId").GetGuid();
+    }
+
+    private static async Task<JsonDocument> ReadJsonAsync(
+        HttpResponseMessage response)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        return await JsonDocument.ParseAsync(stream);
+    }
+
     private static async Task<HashSet<string>> GetColumnNamesAsync(
         string connectionString,
         string tableName)
@@ -714,6 +1082,33 @@ public sealed class SqlServerWorkflowPersistenceTests
         }
 
         return names;
+    }
+
+    private sealed class SqlWorkflowApiFactory(string connectionString)
+        : WebApplicationFactory<Program>
+    {
+        protected override void ConfigureWebHost(IWebHostBuilder builder)
+        {
+            builder.UseEnvironment("Testing");
+            builder.ConfigureTestServices(services =>
+            {
+                services.RemoveAll<IHostedService>();
+                services.RemoveAll<WorkflowInstanceRepository>();
+                services.RemoveAll<IWorkflowInstanceStore>();
+                services.RemoveAll<WorkflowExecutionLogRepository>();
+                services.RemoveAll<IWorkflowExecutionLogStore>();
+                services.RemoveAll<IWorkflowOutboxStore>();
+
+                services.AddSingleton(_ => new WorkflowInstanceRepository(connectionString));
+                services.AddSingleton<IWorkflowInstanceStore>(sp =>
+                    sp.GetRequiredService<WorkflowInstanceRepository>());
+                services.AddSingleton(_ => new WorkflowExecutionLogRepository(connectionString));
+                services.AddSingleton<IWorkflowExecutionLogStore>(sp =>
+                    sp.GetRequiredService<WorkflowExecutionLogRepository>());
+                services.AddSingleton<IWorkflowOutboxStore>(sp =>
+                    sp.GetRequiredService<WorkflowExecutionLogRepository>());
+            });
+        }
     }
 
     private sealed class SqlFirstPayloadStep : IWorkflowStep<WorkflowContext>

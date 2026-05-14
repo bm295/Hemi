@@ -134,6 +134,15 @@ public sealed class OrderFulfillmentEndpointTests(
         Assert.Equal(
             firstPayload.RootElement.GetProperty("commandId").GetString(),
             secondPayload.RootElement.GetProperty("commandId").GetString());
+        Assert.Equal(
+            firstPayload.RootElement.GetProperty("workflowInstanceId").GetString(),
+            secondPayload.RootElement.GetProperty("workflowInstanceId").GetString());
+        Assert.Equal(
+            firstPayload.RootElement.GetProperty("acceptedAtUtc").GetDateTimeOffset(),
+            secondPayload.RootElement.GetProperty("acceptedAtUtc").GetDateTimeOffset());
+        Assert.Equal(
+            firstPayload.RootElement.GetProperty("idempotencyKey").GetString(),
+            secondPayload.RootElement.GetProperty("idempotencyKey").GetString());
     }
 
     [Fact]
@@ -170,6 +179,39 @@ public sealed class OrderFulfillmentEndpointTests(
 
         Assert.Equal(
             "workflow.idempotency_conflict",
+            payload.RootElement.GetProperty("code").GetString());
+    }
+
+    [Fact]
+    public async Task Post_fulfillment_saga_rejects_same_order_correlation_with_different_idempotency_key()
+    {
+        var client = factory.CreateClient();
+        var orderId = Guid.NewGuid();
+        var request = new
+        {
+            method = PaymentMethod.Card,
+            amount = 51.00m
+        };
+
+        using var firstResponse = await SendWithIdempotencyKeyAsync(
+            client,
+            orderId,
+            request,
+            $"order-fulfillment-test-{Guid.NewGuid():N}");
+
+        using var secondResponse = await SendWithIdempotencyKeyAsync(
+            client,
+            orderId,
+            request,
+            $"order-fulfillment-test-{Guid.NewGuid():N}");
+
+        Assert.Equal(HttpStatusCode.Accepted, firstResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, secondResponse.StatusCode);
+
+        using var payload = await ReadJsonAsync(secondResponse);
+
+        Assert.Equal(
+            "workflow.correlation_conflict",
             payload.RootElement.GetProperty("code").GetString());
     }
 
