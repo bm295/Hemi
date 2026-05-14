@@ -161,6 +161,8 @@ BEGIN
         LastAttemptAtUtc DATETIMEOFFSET NULL,
         NextAttemptAtUtc DATETIMEOFFSET NULL,
         PublishedAtUtc DATETIMEOFFSET NULL,
+        LeaseOwner NVARCHAR(128) NULL,
+        LeaseUntilUtc DATETIMEOFFSET NULL,
         CONSTRAINT FK_WorkflowOutboxMessage_WorkflowInstance
             FOREIGN KEY (WorkflowInstanceId) REFERENCES dbo.WorkflowInstance(Id)
     );
@@ -175,10 +177,24 @@ BEGIN
 END;
 GO
 
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_WorkflowOutboxMessage_Status_NextAttempt_CreatedAt' AND object_id = OBJECT_ID(N'dbo.WorkflowOutboxMessage'))
+IF COL_LENGTH(N'dbo.WorkflowOutboxMessage', N'LeaseOwner') IS NULL
 BEGIN
-    CREATE INDEX IX_WorkflowOutboxMessage_Status_NextAttempt_CreatedAt
-        ON dbo.WorkflowOutboxMessage(Status, NextAttemptAtUtc, CreatedAtUtc);
+    ALTER TABLE dbo.WorkflowOutboxMessage
+        ADD LeaseOwner NVARCHAR(128) NULL;
+END;
+GO
+
+IF COL_LENGTH(N'dbo.WorkflowOutboxMessage', N'LeaseUntilUtc') IS NULL
+BEGIN
+    ALTER TABLE dbo.WorkflowOutboxMessage
+        ADD LeaseUntilUtc DATETIMEOFFSET NULL;
+END;
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_WorkflowOutboxMessage_Status_NextAttempt_Lease' AND object_id = OBJECT_ID(N'dbo.WorkflowOutboxMessage'))
+BEGIN
+    CREATE INDEX IX_WorkflowOutboxMessage_Status_NextAttempt_Lease
+        ON dbo.WorkflowOutboxMessage(Status, NextAttemptAtUtc, LeaseUntilUtc, CreatedAtUtc);
 END;
 GO
 

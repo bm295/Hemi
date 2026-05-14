@@ -12,6 +12,10 @@ public sealed class WorkflowOutboxPublisher(
 {
     private static readonly JsonSerializerOptions SerializerOptions =
         new(JsonSerializerDefaults.Web);
+    private static readonly TimeSpan LeaseDuration = TimeSpan.FromMinutes(5);
+
+    private readonly string _leaseOwner =
+        $"{Environment.MachineName}:{Guid.NewGuid():N}";
 
     public async Task<int> PublishPendingAsync(
         int batchSize = 50,
@@ -30,9 +34,11 @@ public sealed class WorkflowOutboxPublisher(
         var retryLimit = Math.Max(1, maxRetryAttempts);
         var delay = retryDelay ?? TimeSpan.FromSeconds(5);
         var nowUtc = dueAtUtc ?? DateTimeOffset.UtcNow;
-        var pendingMessages = await outboxStore.GetPendingMessagesAsync(
-            batchSize,
+        var pendingMessages = await outboxStore.ClaimPendingMessagesAsync(
             nowUtc,
+            _leaseOwner,
+            LeaseDuration,
+            batchSize,
             cancellationToken);
 
         var publishedCount = 0;

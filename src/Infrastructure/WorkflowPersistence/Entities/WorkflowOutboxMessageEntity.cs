@@ -35,5 +35,9 @@ public sealed class WorkflowOutboxMessageEntity
 
     public DateTimeOffset? PublishedAtUtc { get; set; }
 
+    public string? LeaseOwner { get; set; }
+
+    public DateTimeOffset? LeaseUntilUtc { get; set; }
+
     public WorkflowInstanceEntity? WorkflowInstance { get; set; }
 }

@@ -16,7 +16,8 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
     private const string OutboxColumns = """
         Id, WorkflowInstanceId, MessageType, Destination, PayloadJson,
         HeadersJson, Status, RetryCount, ErrorMessage, CreatedAtUtc,
-        LastAttemptAtUtc, NextAttemptAtUtc, PublishedAtUtc
+        LastAttemptAtUtc, NextAttemptAtUtc, PublishedAtUtc, LeaseOwner,
+        LeaseUntilUtc
         """;
 
     public async Task<IReadOnlyCollection<WorkflowStepAttemptRecord>> GetStepAttemptsAsync(
@@ -224,14 +225,18 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
             .ToArray();
     }
 
-    public async Task<IReadOnlyCollection<WorkflowOutboxMessageRecord>> GetPendingMessagesAsync(
+    public async Task<IReadOnlyCollection<WorkflowOutboxMessageRecord>> ClaimPendingMessagesAsync(
+        DateTimeOffset nowUtc,
+        string leaseOwner,
+        TimeSpan leaseDuration,
         int batchSize = 50,
-        DateTimeOffset? dueAtUtc = null,
         CancellationToken cancellationToken = default)
     {
-        var messages = await GetPendingOutboxMessagesAsync(
+        var messages = await ClaimPendingOutboxMessagesAsync(
+            nowUtc,
+            leaseOwner,
+            leaseDuration,
             batchSize,
-            dueAtUtc,
             cancellationToken);
 
         return messages
@@ -362,11 +367,27 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         return result;
     }
 
-    public async Task<IReadOnlyCollection<WorkflowOutboxMessageEntity>> GetPendingOutboxMessagesAsync(
+    public async Task<IReadOnlyCollection<WorkflowOutboxMessageEntity>> ClaimPendingOutboxMessagesAsync(
+        DateTimeOffset nowUtc,
+        string leaseOwner,
+        TimeSpan leaseDuration,
         int batchSize = 50,
-        DateTimeOffset? dueAtUtc = null,
         CancellationToken cancellationToken = default)
     {
+        if (string.IsNullOrWhiteSpace(leaseOwner))
+        {
+            throw new ArgumentException(
+                "Lease owner is required.",
+                nameof(leaseOwner));
+        }
+
+        if (leaseDuration <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(leaseDuration),
+                "Lease duration must be greater than zero.");
+        }
+
         if (batchSize <= 0)
         {
             throw new ArgumentOutOfRangeException(
@@ -377,20 +398,36 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
 
-        var sql = $"""
-            SELECT TOP (@BatchSize) {OutboxColumns}
-            FROM dbo.WorkflowOutboxMessage
-            WHERE Status = @Status
-              AND (NextAttemptAtUtc IS NULL OR NextAttemptAtUtc <= @DueAtUtc)
-            ORDER BY CreatedAtUtc;
+        const string sql = """
+            ;WITH PendingMessages AS (
+                SELECT TOP (@BatchSize) *
+                FROM dbo.WorkflowOutboxMessage WITH (UPDLOCK, READPAST, ROWLOCK)
+                WHERE Status = @Status
+                  AND (NextAttemptAtUtc IS NULL OR NextAttemptAtUtc <= @NowUtc)
+                  AND (LeaseUntilUtc IS NULL OR LeaseUntilUtc <= @NowUtc)
+                ORDER BY CreatedAtUtc
+            )
+            UPDATE PendingMessages
+            SET LeaseOwner = @LeaseOwner,
+                LeaseUntilUtc = @LeaseUntilUtc
+            OUTPUT inserted.Id, inserted.WorkflowInstanceId,
+                   inserted.MessageType, inserted.Destination,
+                   inserted.PayloadJson, inserted.HeadersJson,
+                   inserted.Status, inserted.RetryCount,
+                   inserted.ErrorMessage, inserted.CreatedAtUtc,
+                   inserted.LastAttemptAtUtc, inserted.NextAttemptAtUtc,
+                   inserted.PublishedAtUtc, inserted.LeaseOwner,
+                   inserted.LeaseUntilUtc;
             """;
 
         await using var command = new SqlCommand(sql, connection);
         _ = command.Parameters.Add("@BatchSize", SqlDbType.Int).Value = batchSize;
         _ = command.Parameters.Add("@Status", SqlDbType.NVarChar, 32).Value =
             WorkflowOutboxMessageStatus.Pending.ToString();
-        _ = command.Parameters.Add("@DueAtUtc", SqlDbType.DateTimeOffset).Value =
-            dueAtUtc ?? DateTimeOffset.UtcNow;
+        _ = command.Parameters.Add("@NowUtc", SqlDbType.DateTimeOffset).Value = nowUtc;
+        _ = command.Parameters.Add("@LeaseOwner", SqlDbType.NVarChar, 128).Value = leaseOwner;
+        _ = command.Parameters.Add("@LeaseUntilUtc", SqlDbType.DateTimeOffset).Value =
+            nowUtc.Add(leaseDuration);
 
         var result = new List<WorkflowOutboxMessageEntity>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -443,16 +480,20 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
                     ErrorMessage = @ErrorMessage,
                     LastAttemptAtUtc = @LastAttemptAtUtc,
                     NextAttemptAtUtc = @NextAttemptAtUtc,
-                    PublishedAtUtc = @PublishedAtUtc
+                    PublishedAtUtc = @PublishedAtUtc,
+                    LeaseOwner = @LeaseOwner,
+                    LeaseUntilUtc = @LeaseUntilUtc
             WHEN NOT MATCHED THEN
                 INSERT (Id, WorkflowInstanceId, MessageType, Destination,
                         PayloadJson, HeadersJson, Status, RetryCount,
                         ErrorMessage, CreatedAtUtc, LastAttemptAtUtc,
-                        NextAttemptAtUtc, PublishedAtUtc)
+                        NextAttemptAtUtc, PublishedAtUtc, LeaseOwner,
+                        LeaseUntilUtc)
                 VALUES (@Id, @WorkflowInstanceId, @MessageType, @Destination,
                         @PayloadJson, @HeadersJson, @Status, @RetryCount,
                         @ErrorMessage, @CreatedAtUtc, @LastAttemptAtUtc,
-                        @NextAttemptAtUtc, @PublishedAtUtc);
+                        @NextAttemptAtUtc, @PublishedAtUtc, @LeaseOwner,
+                        @LeaseUntilUtc);
             """;
 
         await using var command = new SqlCommand(sql, connection);
@@ -474,7 +515,9 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
                 ErrorMessage = NULL,
                 LastAttemptAtUtc = @PublishedAtUtc,
                 NextAttemptAtUtc = NULL,
-                PublishedAtUtc = @PublishedAtUtc
+                PublishedAtUtc = @PublishedAtUtc,
+                LeaseOwner = NULL,
+                LeaseUntilUtc = NULL
             WHERE Id = @Id;
             """;
 
@@ -511,7 +554,9 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
                 RetryCount = RetryCount + 1,
                 ErrorMessage = @ErrorMessage,
                 LastAttemptAtUtc = @LastAttemptAtUtc,
-                NextAttemptAtUtc = @NextAttemptAtUtc
+                NextAttemptAtUtc = @NextAttemptAtUtc,
+                LeaseOwner = NULL,
+                LeaseUntilUtc = NULL
             WHERE Id = @Id;
             """;
 
@@ -733,6 +778,8 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
         AddNullable(command, "@LastAttemptAtUtc", SqlDbType.DateTimeOffset, entity.LastAttemptAtUtc);
         AddNullable(command, "@NextAttemptAtUtc", SqlDbType.DateTimeOffset, entity.NextAttemptAtUtc);
         AddNullable(command, "@PublishedAtUtc", SqlDbType.DateTimeOffset, entity.PublishedAtUtc);
+        AddNullable(command, "@LeaseOwner", SqlDbType.NVarChar, 128, entity.LeaseOwner);
+        AddNullable(command, "@LeaseUntilUtc", SqlDbType.DateTimeOffset, entity.LeaseUntilUtc);
     }
 
     private static WorkflowStepExecutionEntity MapStepExecution(SqlDataReader reader) =>
@@ -784,7 +831,9 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
             CreatedAtUtc = reader.GetDateTimeOffset(9),
             LastAttemptAtUtc = reader.IsDBNull(10) ? null : reader.GetDateTimeOffset(10),
             NextAttemptAtUtc = reader.IsDBNull(11) ? null : reader.GetDateTimeOffset(11),
-            PublishedAtUtc = reader.IsDBNull(12) ? null : reader.GetDateTimeOffset(12)
+            PublishedAtUtc = reader.IsDBNull(12) ? null : reader.GetDateTimeOffset(12),
+            LeaseOwner = reader.IsDBNull(13) ? null : reader.GetString(13),
+            LeaseUntilUtc = reader.IsDBNull(14) ? null : reader.GetDateTimeOffset(14)
         };
 
     private static WorkflowOutboxMessageRecord MapOutboxRecord(
@@ -802,7 +851,9 @@ public sealed class WorkflowExecutionLogRepository(string connectionString)
             entity.CreatedAtUtc,
             entity.LastAttemptAtUtc,
             entity.NextAttemptAtUtc,
-            entity.PublishedAtUtc);
+            entity.PublishedAtUtc,
+            entity.LeaseOwner,
+            entity.LeaseUntilUtc);
 
     private static WorkflowStepAttemptStatus MapAttemptStatus(
         WorkflowStepExecutionStatus status) =>

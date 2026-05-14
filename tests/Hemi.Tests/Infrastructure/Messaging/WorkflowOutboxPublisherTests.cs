@@ -70,6 +70,10 @@ public sealed class WorkflowOutboxPublisherTests
         Assert.Equal(message.Destination, envelope.Destination);
         Assert.Equal("order-fulfillment", envelope.Headers["workflow-id"]);
         Assert.Equal(message.Id, Assert.Single(outboxStore.PublishedMessageIds));
+        var claim = Assert.Single(outboxStore.Claims);
+        Assert.Equal(10, claim.BatchSize);
+        Assert.False(string.IsNullOrWhiteSpace(claim.LeaseOwner));
+        Assert.True(claim.LeaseDuration > TimeSpan.Zero);
         Assert.Empty(outboxStore.FailedMessages);
     }
 
@@ -124,6 +128,8 @@ public sealed class WorkflowOutboxPublisherTests
 
         public List<WorkflowOutboxMessageDraft> SavedMessages { get; } = [];
 
+        public List<ClaimedOutboxMessages> Claims { get; } = [];
+
         public List<Guid> PublishedMessageIds { get; } = [];
 
         public List<FailedOutboxMessage> FailedMessages { get; } = [];
@@ -154,12 +160,29 @@ public sealed class WorkflowOutboxPublisherTests
             CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyCollection<WorkflowOutboxMessageRecord>>([]);
 
-        public Task<IReadOnlyCollection<WorkflowOutboxMessageRecord>> GetPendingMessagesAsync(
+        public Task<IReadOnlyCollection<WorkflowOutboxMessageRecord>> ClaimPendingMessagesAsync(
+            DateTimeOffset nowUtc,
+            string leaseOwner,
+            TimeSpan leaseDuration,
             int batchSize = 50,
-            DateTimeOffset? dueAtUtc = null,
             CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyCollection<WorkflowOutboxMessageRecord>>(
-                _pendingMessages.Take(batchSize).ToArray());
+                Claim(nowUtc, leaseOwner, leaseDuration, batchSize));
+
+        private IReadOnlyCollection<WorkflowOutboxMessageRecord> Claim(
+            DateTimeOffset nowUtc,
+            string leaseOwner,
+            TimeSpan leaseDuration,
+            int batchSize)
+        {
+            Claims.Add(new ClaimedOutboxMessages(
+                nowUtc,
+                leaseOwner,
+                leaseDuration,
+                batchSize));
+
+            return _pendingMessages.Take(batchSize).ToArray();
+        }
 
         public Task MarkMessagePublishedAsync(
             Guid messageId,
@@ -210,4 +233,10 @@ public sealed class WorkflowOutboxPublisherTests
         string ErrorMessage,
         DateTimeOffset LastAttemptAtUtc,
         DateTimeOffset? NextAttemptAtUtc);
+
+    private sealed record ClaimedOutboxMessages(
+        DateTimeOffset NowUtc,
+        string LeaseOwner,
+        TimeSpan LeaseDuration,
+        int BatchSize);
 }

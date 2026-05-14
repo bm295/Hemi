@@ -49,13 +49,15 @@ public sealed class SqlServerWorkflowPersistenceTests
         Assert.Contains("HeadersJson", outboxColumns);
         Assert.Contains("NextAttemptAtUtc", outboxColumns);
         Assert.Contains("PublishedAtUtc", outboxColumns);
+        Assert.Contains("LeaseOwner", outboxColumns);
+        Assert.Contains("LeaseUntilUtc", outboxColumns);
 
         var indexes = await GetIndexNamesAsync(database.ConnectionString);
         Assert.Contains("UX_WorkflowInstance_Workflow_Correlation", indexes);
         Assert.Contains("UX_WorkflowInstance_IdempotencyKey", indexes);
         Assert.Contains("IX_WorkflowInstance_State_NextAttempt_Lease", indexes);
         Assert.Contains("UX_WorkflowStepExecution_Instance_Order_Attempt", indexes);
-        Assert.Contains("IX_WorkflowOutboxMessage_Status_NextAttempt_CreatedAt", indexes);
+        Assert.Contains("IX_WorkflowOutboxMessage_Status_NextAttempt_Lease", indexes);
         Assert.Contains("IX_WorkflowOutboxMessage_WorkflowInstanceId", indexes);
     }
 
@@ -882,11 +884,18 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Equal(WorkflowOutboxStatus.Pending, message.Status);
             Assert.Equal(0, message.RetryCount);
 
-            var pending = await outboxStore.GetPendingMessagesAsync(
-                batchSize: 10,
-                dueAtUtc: DateTimeOffset.UtcNow);
+            var pending = await outboxStore.ClaimPendingMessagesAsync(
+                DateTimeOffset.UtcNow,
+                "outbox-store-test",
+                TimeSpan.FromMinutes(5),
+                batchSize: 10);
 
             Assert.Contains(pending, pendingMessage => pendingMessage.Id == message.Id);
+            var claimed = Assert.Single(
+                pending,
+                pendingMessage => pendingMessage.Id == message.Id);
+            Assert.Equal("outbox-store-test", claimed.LeaseOwner);
+            Assert.NotNull(claimed.LeaseUntilUtc);
 
             await outboxStore.MarkMessageFailedAsync(
                 message.Id,
@@ -902,6 +911,8 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Equal("transport unavailable", retried.ErrorMessage);
             Assert.NotNull(retried.LastAttemptAtUtc);
             Assert.NotNull(retried.NextAttemptAtUtc);
+            Assert.Null(retried.LeaseOwner);
+            Assert.Null(retried.LeaseUntilUtc);
 
             await outboxStore.MarkMessagePublishedAsync(
                 message.Id,
@@ -915,6 +926,8 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Null(published.ErrorMessage);
             Assert.Null(published.NextAttemptAtUtc);
             Assert.NotNull(published.PublishedAtUtc);
+            Assert.Null(published.LeaseOwner);
+            Assert.Null(published.LeaseUntilUtc);
         }
         finally
         {
@@ -994,8 +1007,10 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Equal(WorkflowOutboxStatus.Pending, message.Status);
             Assert.Equal("""{"traceId":"sql-tests"}""", message.HeadersJson);
 
-            var pending = await outboxStore.GetPendingMessagesAsync(
-                dueAtUtc: DateTimeOffset.UtcNow);
+            var pending = await outboxStore.ClaimPendingMessagesAsync(
+                DateTimeOffset.UtcNow,
+                "execution-log-test",
+                TimeSpan.FromMinutes(5));
 
             Assert.Contains(pending, pendingMessage => pendingMessage.Id == message.Id);
 
@@ -1010,6 +1025,8 @@ public sealed class SqlServerWorkflowPersistenceTests
 
             Assert.Equal(WorkflowOutboxStatus.Pending, afterFailure.Status);
             Assert.Equal(1, afterFailure.RetryCount);
+            Assert.Null(afterFailure.LeaseOwner);
+            Assert.Null(afterFailure.LeaseUntilUtc);
 
             await outboxStore.MarkMessagePublishedAsync(
                 message.Id,
@@ -1021,6 +1038,86 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Equal(WorkflowOutboxStatus.Published, afterPublish.Status);
             Assert.NotNull(afterPublish.PublishedAtUtc);
             Assert.Null(afterPublish.ErrorMessage);
+            Assert.Null(afterPublish.LeaseOwner);
+            Assert.Null(afterPublish.LeaseUntilUtc);
+        }
+        finally
+        {
+            await database.DeleteWorkflowInstanceAsync(instance.Id);
+        }
+    }
+
+    [SqlServerFact]
+    public async Task WorkflowOutboxStore_claim_skips_active_leases_and_reclaims_expired_leases()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var instanceRepository = new WorkflowInstanceRepository(database.ConnectionString);
+        var outboxStore = new WorkflowExecutionLogRepository(database.ConnectionString);
+        var nowUtc = DateTimeOffset.UtcNow;
+        var instance = new WorkflowInstanceEntity
+        {
+            Id = Guid.NewGuid(),
+            WorkflowId = WorkflowIds.OrderFulfillment,
+            WorkflowName = "Order Fulfillment",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = WorkflowState.Running,
+            PayloadJson = """{"source":"outbox-lease-test"}"""
+        };
+
+        try
+        {
+            await instanceRepository.SaveAsync(instance);
+
+            var activeLeaseMessage = await outboxStore.SaveMessageAsync(
+                new WorkflowOutboxMessageDraft(
+                    instance.Id,
+                    "workflow.active-lease",
+                    "workflow.events",
+                    """{"state":"pending"}""",
+                    CreatedAtUtc: nowUtc.AddMinutes(-2),
+                    NextAttemptAtUtc: nowUtc.AddMinutes(-2)));
+
+            var activeClaim = await outboxStore.ClaimPendingMessagesAsync(
+                nowUtc,
+                "active-owner",
+                TimeSpan.FromMinutes(5),
+                batchSize: 10);
+
+            _ = Assert.Single(
+                activeClaim,
+                message => message.Id == activeLeaseMessage.Id);
+
+            var expiredLeaseMessage = new WorkflowOutboxMessageEntity
+            {
+                Id = Guid.NewGuid(),
+                WorkflowInstanceId = instance.Id,
+                MessageType = "workflow.expired-lease",
+                Destination = "workflow.events",
+                PayloadJson = """{"state":"pending"}""",
+                Status = WorkflowOutboxMessageStatus.Pending,
+                CreatedAtUtc = nowUtc.AddMinutes(-1),
+                NextAttemptAtUtc = nowUtc.AddMinutes(-1),
+                LeaseOwner = "expired-owner",
+                LeaseUntilUtc = nowUtc.AddMinutes(-1)
+            };
+
+            await outboxStore.SaveOutboxMessageAsync(expiredLeaseMessage);
+
+            var secondClaim = await outboxStore.ClaimPendingMessagesAsync(
+                nowUtc,
+                "replacement-owner",
+                TimeSpan.FromMinutes(5),
+                batchSize: 10);
+
+            Assert.DoesNotContain(
+                secondClaim,
+                message => message.Id == activeLeaseMessage.Id);
+
+            var reclaimed = Assert.Single(
+                secondClaim,
+                message => message.Id == expiredLeaseMessage.Id);
+            Assert.Equal("replacement-owner", reclaimed.LeaseOwner);
+            Assert.NotNull(reclaimed.LeaseUntilUtc);
         }
         finally
         {
@@ -1132,12 +1229,19 @@ public sealed class SqlServerWorkflowPersistenceTests
 
             await logRepository.SaveOutboxMessageAsync(outboxMessage);
 
-            var pendingMessages = await logRepository.GetPendingOutboxMessagesAsync(
-                dueAtUtc: DateTimeOffset.UtcNow);
+            var pendingMessages = await logRepository.ClaimPendingOutboxMessagesAsync(
+                DateTimeOffset.UtcNow,
+                "log-repository-test",
+                TimeSpan.FromMinutes(5));
 
             Assert.Contains(
                 pendingMessages,
                 message => message.Id == outboxMessage.Id);
+            var claimedOutboxMessage = Assert.Single(
+                pendingMessages,
+                message => message.Id == outboxMessage.Id);
+            Assert.Equal("log-repository-test", claimedOutboxMessage.LeaseOwner);
+            Assert.NotNull(claimedOutboxMessage.LeaseUntilUtc);
 
             await logRepository.MarkOutboxMessageFailedAsync(
                 outboxMessage.Id,
@@ -1150,6 +1254,8 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Equal(WorkflowOutboxMessageStatus.Pending, failedMessage.Status);
             Assert.Equal(1, failedMessage.RetryCount);
             Assert.Equal("transient failure", failedMessage.ErrorMessage);
+            Assert.Null(failedMessage.LeaseOwner);
+            Assert.Null(failedMessage.LeaseUntilUtc);
 
             await logRepository.MarkOutboxMessagePublishedAsync(
                 outboxMessage.Id,
@@ -1160,6 +1266,8 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Equal(WorkflowOutboxMessageStatus.Published, publishedMessage.Status);
             Assert.NotNull(publishedMessage.PublishedAtUtc);
             Assert.Null(publishedMessage.ErrorMessage);
+            Assert.Null(publishedMessage.LeaseOwner);
+            Assert.Null(publishedMessage.LeaseUntilUtc);
         }
         finally
         {

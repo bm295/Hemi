@@ -29,7 +29,9 @@ public sealed record WorkflowOutboxMessageRecord(
     DateTimeOffset CreatedAtUtc,
     DateTimeOffset? LastAttemptAtUtc,
     DateTimeOffset? NextAttemptAtUtc,
-    DateTimeOffset? PublishedAtUtc);
+    DateTimeOffset? PublishedAtUtc,
+    string? LeaseOwner = null,
+    DateTimeOffset? LeaseUntilUtc = null);
 
 public interface IWorkflowOutboxStore
 {
@@ -41,9 +43,11 @@ public interface IWorkflowOutboxStore
         Guid workflowInstanceId,
         CancellationToken cancellationToken = default);
 
-    Task<IReadOnlyCollection<WorkflowOutboxMessageRecord>> GetPendingMessagesAsync(
+    Task<IReadOnlyCollection<WorkflowOutboxMessageRecord>> ClaimPendingMessagesAsync(
+        DateTimeOffset nowUtc,
+        string leaseOwner,
+        TimeSpan leaseDuration,
         int batchSize = 50,
-        DateTimeOffset? dueAtUtc = null,
         CancellationToken cancellationToken = default);
 
     Task MarkMessagePublishedAsync(
