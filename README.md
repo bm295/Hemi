@@ -95,6 +95,6 @@ Current durability boundary:
 - Workflow state, step attempts, workflow event outbox messages, worker leases, and outbox leases are SQL-backed.
 - Core restaurant ports for tables, menu, orders, payments, reservations, and inventory are SQL-backed in the application host. `src/Infrastructure/FnbPersistence/Sql/FnbTables.sql` creates and idempotently seeds the restaurant profile, tables, menu, inventory, and sample reservations with deterministic IDs.
 - Payment creation uses the order's settled-payment natural key, enforced by `UX_FnbPayment_Order_Settled`. Inventory deduction/restoration uses order + inventory item + reason, enforced by `UX_FnbStockMovement_Order_Inventory_Reason`, so retries return existing side effects instead of duplicating them.
-- `IWorkflowMessagePublisher` is currently bound to an in-memory publisher. The SQL outbox is durable, but final message delivery is a local/demo transport until a production broker adapter is supplied.
+- `IWorkflowMessagePublisher` is the final delivery boundary and is currently bound to `InMemoryWorkflowMessagePublisher` for local/demo use because no real broker is specified. Production should replace that DI binding with a broker adapter while retaining the SQL outbox, `OutboxWorkflowEventPublisher`, lease-fenced `WorkflowOutboxPublisher`, and hosted outbox publisher service.
 
 More detail: `docs/durable-workflow-orchestrator.md`.

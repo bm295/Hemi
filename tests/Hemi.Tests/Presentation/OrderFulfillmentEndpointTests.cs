@@ -8,6 +8,7 @@ using Hemi.Application.Workflows.Contracts;
 using Hemi.Application.Workflows.Definitions.OrderFulfillment;
 using Hemi.Domain;
 using Hemi.Domain.Workflows;
+using Hemi.Infrastructure.Messaging;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
@@ -539,6 +540,16 @@ public sealed class OrderFulfillmentEndpointTests(
             services.GetRequiredService<LegacyOrderFulfillmentSagaQueryService>());
         Assert.NotNull(
             services.GetRequiredService<ISagaStateQueryPort>());
+    }
+
+    [Fact]
+    public void Workflow_outbox_transport_defaults_to_in_memory_publisher()
+    {
+        using var scope = factory.Services.CreateScope();
+        var services = scope.ServiceProvider;
+
+        Assert.IsType<InMemoryWorkflowMessagePublisher>(
+            services.GetRequiredService<IWorkflowMessagePublisher>());
     }
 
     private static async Task<HttpResponseMessage> SendWithIdempotencyKeyAsync(

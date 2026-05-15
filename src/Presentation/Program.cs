@@ -16,6 +16,7 @@ using Hemi.Infrastructure.WorkflowPersistence.Repositories;
 using Hemi.Presentation.BackgroundWorkers;
 using Hemi.Presentation.Endpoints;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -77,7 +78,11 @@ builder.Services.AddSingleton(new WorkflowPolicyRegistration(
     WorkflowIds.InventoryReconciliation,
     WorkflowPolicies.Default));
 builder.Services.AddSingleton<IRetryPolicyProvider, RetryPolicyProvider>();
-builder.Services.AddSingleton<IWorkflowMessagePublisher, InMemoryWorkflowMessagePublisher>();
+
+// Final outbox transport boundary. Production hosts replace this binding with a
+// broker-backed IWorkflowMessagePublisher while keeping the SQL outbox and
+// lease-fenced WorkflowOutboxPublisher in place.
+builder.Services.TryAddSingleton<IWorkflowMessagePublisher, InMemoryWorkflowMessagePublisher>();
 builder.Services.AddSingleton<WorkflowOutboxPublisher>();
 builder.Services.AddSingleton<IWorkflowEventPublisher, OutboxWorkflowEventPublisher>();
 builder.Services.AddSingleton<WorkflowCommandQueue>();

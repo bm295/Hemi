@@ -8,6 +8,9 @@ public sealed record WorkflowMessageEnvelope(
     DateTimeOffset CreatedAtUtc,
     IReadOnlyDictionary<string, string> Headers);
 
+/// <summary>
+/// Final delivery boundary for messages claimed from the durable workflow outbox.
+/// </summary>
 public interface IWorkflowMessagePublisher
 {
     Task PublishAsync(

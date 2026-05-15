@@ -38,10 +38,14 @@ outbox events survive process restart through SQL Server; the restaurant side
 effects performed by workflow steps do not yet survive restart unless those
 ports are replaced by durable adapters.
 
-The outbox itself is SQL-backed. The final `IWorkflowMessagePublisher` binding
-is currently `InMemoryWorkflowMessagePublisher`, so event delivery is a local
-demo transport. A production deployment should replace that binding with a
-broker adapter while keeping the SQL outbox claim/publish flow.
+The outbox itself is SQL-backed. `WorkflowOutboxPublisher` is the
+lease-fenced SQL outbox dispatcher, not the broker adapter. Its final delivery
+dependency is `IWorkflowMessagePublisher`, and the application host currently
+binds that boundary to `InMemoryWorkflowMessagePublisher` so local demos can
+run without a real broker. A production deployment should replace only the
+`IWorkflowMessagePublisher` binding with a broker adapter while keeping the SQL
+outbox store, `OutboxWorkflowEventPublisher`, `WorkflowOutboxPublisher`, and
+hosted outbox publisher service in place.
 
 ## SQL Schema
 
@@ -132,7 +136,9 @@ the durable workflow path. Outbox messages include:
 
 The publisher claims eligible messages atomically, skips active leases, retries
 transient failures, and marks exhausted messages as failed only while it still
-owns the outbox lease.
+owns the outbox lease. Broker-specific delivery code should live behind
+`IWorkflowMessagePublisher`; it should not bypass the SQL outbox claim, retry,
+or lease-fencing path.
 
 ## Recoverable Worker Dispatch Failures
 
