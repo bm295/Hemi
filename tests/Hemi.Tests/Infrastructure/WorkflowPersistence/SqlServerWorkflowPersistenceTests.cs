@@ -585,6 +585,97 @@ public sealed class SqlServerWorkflowPersistenceTests
     }
 
     [SqlServerFact]
+    public async Task Workflow_instance_updates_can_be_fenced_by_lease_owner()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var repository = new WorkflowInstanceRepository(database.ConnectionString);
+        var instance = new WorkflowInstanceEntity
+        {
+            Id = Guid.NewGuid(),
+            WorkflowId = WorkflowIds.OrderFulfillment,
+            WorkflowName = "Order Fulfillment",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = WorkflowState.Running,
+            PayloadJson = """{"source":"lease-fence-test"}""",
+            Attempt = 1,
+            LeaseOwner = "current-worker",
+            LeaseUntilUtc = DateTimeOffset.UtcNow.AddMinutes(5)
+        };
+
+        try
+        {
+            await repository.SaveAsync(instance);
+
+            var stalePayloadUpdate = await repository.TryUpdatePayloadAsync(
+                instance.Id,
+                instance.Version,
+                """{"source":"stale-worker"}""",
+                expectedLeaseOwner: "stale-worker");
+
+            Assert.False(stalePayloadUpdate);
+
+            var afterStalePayload = await repository.GetByIdAsync(instance.Id);
+
+            Assert.NotNull(afterStalePayload);
+            Assert.Equal(instance.Version, afterStalePayload.Version);
+            Assert.Contains("lease-fence-test", afterStalePayload.PayloadJson, StringComparison.Ordinal);
+
+            var currentPayloadUpdate = await repository.TryUpdatePayloadAsync(
+                instance.Id,
+                afterStalePayload.Version,
+                """{"source":"current-worker"}""",
+                expectedLeaseOwner: "current-worker");
+
+            Assert.True(currentPayloadUpdate);
+
+            var afterCurrentPayload = await repository.GetByIdAsync(instance.Id);
+
+            Assert.NotNull(afterCurrentPayload);
+            Assert.Equal(afterStalePayload.Version + 1, afterCurrentPayload.Version);
+            Assert.Contains("current-worker", afterCurrentPayload.PayloadJson, StringComparison.Ordinal);
+
+            var staleStateUpdate = await repository.TryUpdateStateAsync(
+                instance.Id,
+                WorkflowState.Failed,
+                afterCurrentPayload.Version,
+                lastError: "stale worker failed",
+                completedAtUtc: DateTimeOffset.UtcNow,
+                expectedLeaseOwner: "stale-worker");
+
+            Assert.False(staleStateUpdate);
+
+            var afterStaleState = await repository.GetByIdAsync(instance.Id);
+
+            Assert.NotNull(afterStaleState);
+            Assert.Equal(WorkflowState.Running, afterStaleState.State);
+            Assert.Equal("current-worker", afterStaleState.LeaseOwner);
+
+            var failedAtUtc = DateTimeOffset.UtcNow;
+            var currentStateUpdate = await repository.TryUpdateStateAsync(
+                instance.Id,
+                WorkflowState.Failed,
+                afterStaleState.Version,
+                lastError: "current worker failed",
+                completedAtUtc: failedAtUtc,
+                expectedLeaseOwner: "current-worker");
+
+            Assert.True(currentStateUpdate);
+
+            var afterCurrentState = await repository.GetByIdAsync(instance.Id);
+
+            Assert.NotNull(afterCurrentState);
+            Assert.Equal(WorkflowState.Failed, afterCurrentState.State);
+            Assert.Equal("current worker failed", afterCurrentState.LastError);
+            Assert.Null(afterCurrentState.LeaseOwner);
+            Assert.Null(afterCurrentState.LeaseUntilUtc);
+        }
+        finally
+        {
+            await database.DeleteWorkflowInstanceAsync(instance.Id);
+        }
+    }
+
+    [SqlServerFact]
     public async Task Terminal_workflows_cannot_be_reset_to_pending_or_claimed()
     {
         await using var database = await WorkflowSqlTestDatabase.CreateAsync();

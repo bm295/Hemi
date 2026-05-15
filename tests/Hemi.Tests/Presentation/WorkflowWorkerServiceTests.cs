@@ -76,6 +76,39 @@ public sealed class WorkflowWorkerServiceTests
         Assert.NotNull(store.NextAttemptAtUtc);
         Assert.True(store.NextAttemptAtUtc >= startedAtUtc.AddSeconds(2));
         Assert.Equal(instance.Version + 1, store.StateExpectedVersion);
+        Assert.Equal(instance.LeaseOwner, store.PayloadExpectedLeaseOwner);
+        Assert.Equal(instance.LeaseOwner, store.StateExpectedLeaseOwner);
+    }
+
+    [Fact]
+    public async Task Worker_does_not_update_state_when_fallback_payload_update_loses_lease()
+    {
+        var instance = CreateInstance(
+            attempt: 1,
+            version: 4,
+            payloadJson: """{"marker":"retry-lost-lease"}""");
+        var store = new PollingWorkflowInstanceStore(
+            instance,
+            payloadUpdateSucceeds: false);
+        var dispatcher = new RecordingDispatcher(_ =>
+            throw new InvalidOperationException("temporary workflow failure"));
+
+        using var services = CreateServices(dispatcher);
+        using var worker = CreateWorker(
+            services,
+            store);
+
+        await worker.StartAsync(CancellationToken.None);
+
+        _ = await dispatcher.Handled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        _ = await store.PayloadUpdateAttempted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await worker.StopAsync(CancellationToken.None);
+
+        Assert.Equal(instance.LeaseOwner, store.PayloadExpectedLeaseOwner);
+        Assert.Null(store.State);
+        Assert.Empty(store.StateUpdates);
+        Assert.Null(store.StateExpectedVersion);
+        Assert.Null(store.StateExpectedLeaseOwner);
     }
 
     [Fact]
@@ -104,6 +137,8 @@ public sealed class WorkflowWorkerServiceTests
         Assert.NotNull(store.CompletedAtUtc);
         Assert.Null(store.NextAttemptAtUtc);
         Assert.Equal(instance.Version + 1, store.StateExpectedVersion);
+        Assert.Equal(instance.LeaseOwner, store.PayloadExpectedLeaseOwner);
+        Assert.Equal(instance.LeaseOwner, store.StateExpectedLeaseOwner);
     }
 
     [Fact]
@@ -498,12 +533,16 @@ public sealed class WorkflowWorkerServiceTests
     }
 
     private sealed class PollingWorkflowInstanceStore(
-        WorkflowInstanceRecord instance)
+        WorkflowInstanceRecord instance,
+        bool payloadUpdateSucceeds = true)
         : IWorkflowInstanceStore
     {
         private bool _claimed;
 
         public TaskCompletionSource<bool> StateUpdated { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource<bool> PayloadUpdateAttempted { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public WorkflowState? State { get; private set; }
@@ -512,7 +551,11 @@ public sealed class WorkflowWorkerServiceTests
 
         public int? StateExpectedVersion { get; private set; }
 
+        public string? StateExpectedLeaseOwner { get; private set; }
+
         public string? PayloadJson { get; private set; } = instance.PayloadJson;
+
+        public string? PayloadExpectedLeaseOwner { get; private set; }
 
         public List<string> PayloadUpdateJsons { get; } = [];
 
@@ -571,29 +614,49 @@ public sealed class WorkflowWorkerServiceTests
             string? lastError = null,
             DateTimeOffset? completedAtUtc = null,
             DateTimeOffset? nextAttemptAtUtc = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            string? expectedLeaseOwner = null)
         {
+            if (id != instance.Id ||
+                (expectedLeaseOwner is not null &&
+                 expectedLeaseOwner != instance.LeaseOwner))
+            {
+                return Task.FromResult(false);
+            }
+
             State = state;
             StateUpdates.Add(state);
             StateExpectedVersion = expectedVersion;
+            StateExpectedLeaseOwner = expectedLeaseOwner;
             LastError = lastError;
             CompletedAtUtc = completedAtUtc;
             NextAttemptAtUtc = nextAttemptAtUtc;
             StateUpdated.TrySetResult(true);
-            return Task.FromResult(id == instance.Id);
+            return Task.FromResult(true);
         }
 
         public Task<bool> TryUpdatePayloadAsync(
             Guid id,
             int expectedVersion,
             string payloadJson,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            string? expectedLeaseOwner = null)
         {
+            PayloadExpectedLeaseOwner = expectedLeaseOwner;
+            PayloadUpdateAttempted.TrySetResult(true);
+
+            if (!payloadUpdateSucceeds ||
+                id != instance.Id ||
+                expectedVersion != instance.Version ||
+                (expectedLeaseOwner is not null &&
+                 expectedLeaseOwner != instance.LeaseOwner))
+            {
+                return Task.FromResult(false);
+            }
+
             PayloadJson = payloadJson;
             PayloadUpdateJsons.Add(payloadJson);
-            return Task.FromResult(
-                id == instance.Id &&
-                expectedVersion == instance.Version);
+            return Task.FromResult(true);
         }
 
         public Task<bool> TryReleaseLeaseAsync(

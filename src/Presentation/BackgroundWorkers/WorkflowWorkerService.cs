@@ -216,14 +216,20 @@ public sealed class WorkflowWorkerService(
             payloadJson,
             cancellationToken);
 
+        if (!version.HasValue)
+        {
+            return;
+        }
+
         if (!await workflowInstanceStore.TryUpdateStateAsync(
                 instance.Id,
                 WorkflowState.Pending,
-                version,
+                version.Value,
                 lastError: exception.Message,
                 completedAtUtc: null,
-                nextAttemptAtUtc,
-                cancellationToken))
+                nextAttemptAtUtc: nextAttemptAtUtc,
+                cancellationToken: cancellationToken,
+                expectedLeaseOwner: GetExpectedWorkflowLeaseOwner(context)))
         {
             logger.LogWarning(
                 "Workflow instance {WorkflowInstanceId} retry schedule update lost optimistic concurrency.",
@@ -272,14 +278,20 @@ public sealed class WorkflowWorkerService(
             payloadJson,
             cancellationToken);
 
+        if (!version.HasValue)
+        {
+            return;
+        }
+
         if (!await workflowInstanceStore.TryUpdateStateAsync(
                 instance.Id,
                 WorkflowState.Failed,
-                version,
+                version.Value,
                 exception.Message,
                 failedAtUtc,
                 nextAttemptAtUtc: null,
-                cancellationToken))
+                cancellationToken: cancellationToken,
+                expectedLeaseOwner: GetExpectedWorkflowLeaseOwner(context)))
         {
             logger.LogWarning(
                 "Workflow instance {WorkflowInstanceId} terminal failure update lost optimistic concurrency.",
@@ -287,7 +299,7 @@ public sealed class WorkflowWorkerService(
         }
     }
 
-    private async Task<int> PersistContextPayloadAsync(
+    private async Task<int?> PersistContextPayloadAsync(
         WorkflowInstanceRecord instance,
         WorkflowContext context,
         string payloadJson,
@@ -299,7 +311,8 @@ public sealed class WorkflowWorkerService(
                     ? context.WorkflowInstanceVersion
                     : instance.Version,
                 payloadJson,
-                cancellationToken))
+                cancellationToken,
+                expectedLeaseOwner: GetExpectedWorkflowLeaseOwner(context)))
         {
             context.WorkflowInstanceVersion =
                 context.WorkflowInstanceVersion > 0
@@ -313,9 +326,7 @@ public sealed class WorkflowWorkerService(
             "Workflow instance {WorkflowInstanceId} context payload update lost optimistic concurrency.",
             instance.Id);
 
-        return context.WorkflowInstanceVersion > 0
-            ? context.WorkflowInstanceVersion
-            : instance.Version;
+        return null;
     }
 
     private static string SerializeContext(WorkflowContext context) =>
@@ -351,6 +362,11 @@ public sealed class WorkflowWorkerService(
 
         return context.WorkflowLeaseOwner;
     }
+
+    private static string? GetExpectedWorkflowLeaseOwner(WorkflowContext context) =>
+        string.IsNullOrWhiteSpace(context.WorkflowLeaseOwner)
+            ? null
+            : context.WorkflowLeaseOwner;
 
     private static WorkflowEvent CreateWorkflowEvent(
         WorkflowInstanceRecord instance,

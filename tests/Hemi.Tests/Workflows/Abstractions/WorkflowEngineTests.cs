@@ -131,6 +131,12 @@ public sealed class WorkflowEngineTests
         await engine.ExecuteAsync("test-workflow", definition, context);
 
         Assert.Equal(WorkflowState.Succeeded, instanceStore.States.Last());
+        Assert.All(
+            instanceStore.PayloadExpectedLeaseOwners,
+            leaseOwner => Assert.Equal("workflow-engine-test-worker", leaseOwner));
+        Assert.All(
+            instanceStore.StateUpdates,
+            update => Assert.Equal("workflow-engine-test-worker", update.ExpectedLeaseOwner));
         Assert.Contains(
             publisher.Events,
             workflowEvent => workflowEvent.EventName == WorkflowEvents.WorkflowSucceeded);
@@ -880,13 +886,16 @@ public sealed class WorkflowEngineTests
         WorkflowState State,
         int ExpectedVersion,
         DateTimeOffset? CompletedAtUtc,
-        DateTimeOffset? NextAttemptAtUtc);
+        DateTimeOffset? NextAttemptAtUtc,
+        string? ExpectedLeaseOwner);
 
     private sealed class RecordingWorkflowInstanceStore(
         Action<WorkflowState>? onStateUpdate = null)
         : IWorkflowInstanceStore
     {
         public List<string> Payloads { get; } = [];
+
+        public List<string?> PayloadExpectedLeaseOwners { get; } = [];
 
         public List<WorkflowState> States { get; } = [];
 
@@ -923,14 +932,16 @@ public sealed class WorkflowEngineTests
             string? lastError = null,
             DateTimeOffset? completedAtUtc = null,
             DateTimeOffset? nextAttemptAtUtc = null,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            string? expectedLeaseOwner = null)
         {
             States.Add(state);
             StateUpdates.Add(new StateUpdate(
                 state,
                 expectedVersion,
                 completedAtUtc,
-                nextAttemptAtUtc));
+                nextAttemptAtUtc,
+                expectedLeaseOwner));
             onStateUpdate?.Invoke(state);
             return Task.FromResult(true);
         }
@@ -939,9 +950,11 @@ public sealed class WorkflowEngineTests
             Guid id,
             int expectedVersion,
             string payloadJson,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            string? expectedLeaseOwner = null)
         {
             Payloads.Add(payloadJson);
+            PayloadExpectedLeaseOwners.Add(expectedLeaseOwner);
             return Task.FromResult(true);
         }
 

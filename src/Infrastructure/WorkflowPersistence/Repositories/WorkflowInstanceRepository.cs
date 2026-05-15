@@ -337,7 +337,8 @@ public sealed class WorkflowInstanceRepository(string connectionString)
         string? lastError = null,
         DateTimeOffset? completedAtUtc = null,
         DateTimeOffset? nextAttemptAtUtc = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? expectedLeaseOwner = null)
     {
         if (expectedVersion <= 0)
         {
@@ -361,6 +362,7 @@ public sealed class WorkflowInstanceRepository(string connectionString)
                 LeaseUntilUtc = CASE WHEN @ClearLease = 1 THEN NULL ELSE LeaseUntilUtc END
             WHERE Id = @Id
               AND Version = @ExpectedVersion
+              AND (@ExpectedLeaseOwner IS NULL OR LeaseOwner = @ExpectedLeaseOwner)
               AND NOT (
                   @State = @PendingState
                   AND State IN (
@@ -395,6 +397,12 @@ public sealed class WorkflowInstanceRepository(string connectionString)
         AddNullable(command, "@CompletedAtUtc", SqlDbType.DateTimeOffset, completedAtUtc);
         AddNullable(command, "@NextAttemptAtUtc", SqlDbType.DateTimeOffset, nextAttemptAtUtc);
         _ = command.Parameters.Add("@ClearLease", SqlDbType.Bit).Value = ShouldClearLease(state);
+        AddNullable(
+            command,
+            "@ExpectedLeaseOwner",
+            SqlDbType.NVarChar,
+            128,
+            expectedLeaseOwner);
 
         return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
     }
@@ -403,7 +411,8 @@ public sealed class WorkflowInstanceRepository(string connectionString)
         Guid id,
         int expectedVersion,
         string payloadJson,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? expectedLeaseOwner = null)
     {
         if (expectedVersion <= 0)
         {
@@ -427,7 +436,9 @@ public sealed class WorkflowInstanceRepository(string connectionString)
             SET PayloadJson = @PayloadJson,
                 Version = Version + 1,
                 UpdatedAtUtc = @UpdatedAtUtc
-            WHERE Id = @Id AND Version = @ExpectedVersion;
+            WHERE Id = @Id
+              AND Version = @ExpectedVersion
+              AND (@ExpectedLeaseOwner IS NULL OR LeaseOwner = @ExpectedLeaseOwner);
             """;
 
         await using var command = new SqlCommand(sql, connection);
@@ -436,6 +447,12 @@ public sealed class WorkflowInstanceRepository(string connectionString)
         _ = command.Parameters.Add("@PayloadJson", SqlDbType.NVarChar, -1).Value = payloadJson;
         _ = command.Parameters.Add("@UpdatedAtUtc", SqlDbType.DateTimeOffset).Value =
             DateTimeOffset.UtcNow;
+        AddNullable(
+            command,
+            "@ExpectedLeaseOwner",
+            SqlDbType.NVarChar,
+            128,
+            expectedLeaseOwner);
 
         return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
     }

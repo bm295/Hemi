@@ -76,13 +76,15 @@ public interface IWorkflowInstanceStore
         string? lastError = null,
         DateTimeOffset? completedAtUtc = null,
         DateTimeOffset? nextAttemptAtUtc = null,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        string? expectedLeaseOwner = null);
 
     Task<bool> TryUpdatePayloadAsync(
         Guid id,
         int expectedVersion,
         string payloadJson,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        string? expectedLeaseOwner = null);
 
     Task<bool> TryReleaseLeaseAsync(
         Guid id,

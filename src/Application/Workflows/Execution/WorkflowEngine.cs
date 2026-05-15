@@ -903,7 +903,8 @@ public sealed class WorkflowEngine : IWorkflowEngine
             context.WorkflowInstanceId.Value,
             context.WorkflowInstanceVersion,
             payloadJson,
-            cancellationToken);
+            cancellationToken,
+            expectedLeaseOwner: GetExpectedWorkflowLeaseOwner(context));
 
         if (!updated)
         {
@@ -954,7 +955,8 @@ public sealed class WorkflowEngine : IWorkflowEngine
             error?.Message,
             completedAtUtc,
             nextAttemptAtUtc: null,
-            cancellationToken);
+            cancellationToken,
+            expectedLeaseOwner: GetExpectedWorkflowLeaseOwner(context));
 
         if (!updated)
         {
@@ -1172,6 +1174,11 @@ public sealed class WorkflowEngine : IWorkflowEngine
             or WorkflowState.Compensated
             or WorkflowState.CompensationFailed
             or WorkflowState.Cancelled;
+
+    private static string? GetExpectedWorkflowLeaseOwner(WorkflowContext context) =>
+        string.IsNullOrWhiteSpace(context.WorkflowLeaseOwner)
+            ? null
+            : context.WorkflowLeaseOwner;
 
     private sealed record IndexedStep(
         int Order,
