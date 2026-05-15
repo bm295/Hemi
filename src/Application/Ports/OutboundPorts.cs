@@ -66,8 +66,3 @@ public interface ISagaStateQueryPort
 {
     Task<OrderFulfillmentSagaState?> GetOrderFulfillmentSagaAsync(Guid orderId, CancellationToken cancellationToken = default);
 }
-
-public interface ISagaStateCommandPort
-{
-    Task SaveOrderFulfillmentSagaAsync(OrderFulfillmentSagaState sagaState, CancellationToken cancellationToken = default);
-}

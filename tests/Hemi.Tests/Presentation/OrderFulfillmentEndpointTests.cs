@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
+using Hemi.Application;
 using Hemi.Application.Sagas.Legacy;
 using Hemi.Application.Workflows.Abstractions;
 using Hemi.Application.Workflows.Contracts;
@@ -536,7 +537,8 @@ public sealed class OrderFulfillmentEndpointTests(
 
         Assert.NotNull(
             services.GetRequiredService<LegacyOrderFulfillmentSagaQueryService>());
-        Assert.Null(services.GetService<OrderFulfillmentSagaOrchestrator>());
+        Assert.NotNull(
+            services.GetRequiredService<ISagaStateQueryPort>());
     }
 
     private static async Task<HttpResponseMessage> SendWithIdempotencyKeyAsync(
