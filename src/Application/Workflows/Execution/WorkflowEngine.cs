@@ -70,16 +70,19 @@ public sealed class WorkflowEngine : IWorkflowEngine
         {
             context.State = WorkflowState.Running;
 
-            await JournalWorkflowStateAsync(
-                context,
-                workflowId,
-                workflowDefinition,
-                WorkflowState.Running,
-                WorkflowEvents.WorkflowStarted,
-                stepType: null,
-                error: null,
-                completedAtUtc: null,
-                executionToken);
+            if (persistedAttempts.Count == 0)
+            {
+                await JournalWorkflowStateAsync(
+                    context,
+                    workflowId,
+                    workflowDefinition,
+                    WorkflowState.Running,
+                    WorkflowEvents.WorkflowStarted,
+                    stepType: null,
+                    error: null,
+                    completedAtUtc: null,
+                    executionToken);
+            }
 
             foreach (var indexedStep in EnumerateSteps(workflowDefinition))
             {

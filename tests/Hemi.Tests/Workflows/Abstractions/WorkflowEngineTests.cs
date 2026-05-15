@@ -207,6 +207,72 @@ public sealed class WorkflowEngineTests
     }
 
     [Fact]
+    public async Task ExecuteAsync_skips_started_journal_entry_when_resuming_with_persisted_attempts()
+    {
+        var services = new ServiceCollection();
+        var recorder = new StepRecorder();
+        var workflowInstanceId = Guid.Parse("44444444-4444-4444-4444-444444444444");
+        var journal = new RecordingWorkflowJournal();
+        var logStore = new RecordingWorkflowExecutionLogStore(
+        [
+            new WorkflowStepAttemptRecord(
+                Guid.NewGuid(),
+                workflowInstanceId,
+                StepName: nameof(FirstStep),
+                StepOrder: 1,
+                WorkflowStepAttemptStatus.Succeeded,
+                Attempt: 1,
+                CommandId: Guid.NewGuid(),
+                ErrorMessage: null,
+                StartedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-5),
+                CompletedAtUtc: DateTimeOffset.UtcNow.AddSeconds(-4),
+                CompensatedAtUtc: null)
+        ]);
+        services.AddSingleton(recorder);
+        services.AddSingleton<IWorkflowJournal>(journal);
+        services.AddSingleton<IWorkflowExecutionLogStore>(logStore);
+        services.AddTransient<FirstStep>();
+        services.AddTransient<SecondStep>();
+
+        var engine = CreateEngine(services, new RecordingWorkflowEventPublisher());
+        var context = new WorkflowContext("test-workflow", "correlation-journal-resume")
+        {
+            WorkflowInstanceId = workflowInstanceId,
+            WorkflowInstanceVersion = 2,
+            WorkflowAttempt = 2,
+            WorkflowLeaseOwner = "workflow-engine-test-worker",
+            CommandId = Guid.NewGuid()
+        };
+        var definition = WorkflowDefinition.Create(
+            "Test Workflow",
+            typeof(FirstStep),
+            typeof(SecondStep));
+
+        await engine.ExecuteAsync("test-workflow", definition, context);
+
+        Assert.Equal(["second"], recorder.Executed);
+        Assert.DoesNotContain(
+            journal.Entries,
+            entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StateTransition &&
+                entry.Event?.EventName == WorkflowEvents.WorkflowStarted);
+        Assert.Contains(
+            journal.Entries,
+            entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StepAttemptTransition &&
+                entry.Step?.StepOrder == 2 &&
+                entry.Step.Action == WorkflowStepJournalAction.Running &&
+                entry.Event?.EventName == WorkflowEvents.StepStarted);
+        Assert.Contains(
+            journal.Entries,
+            entry =>
+                entry.Operation == RecordedWorkflowJournalOperation.StateTransition &&
+                entry.State?.State == WorkflowState.Succeeded &&
+                entry.Event?.EventName == WorkflowEvents.WorkflowSucceeded);
+        Assert.Equal(4, context.WorkflowInstanceVersion);
+    }
+
+    [Fact]
     public async Task ExecuteAsync_journals_step_failure_and_terminal_failure_with_explicit_methods()
     {
         var services = new ServiceCollection();
