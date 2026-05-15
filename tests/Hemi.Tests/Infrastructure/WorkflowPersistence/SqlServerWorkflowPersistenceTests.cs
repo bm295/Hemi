@@ -3,12 +3,15 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
+using Hemi.Application;
+using Hemi.Application.Sagas.Legacy;
 using Hemi.Application.Workflows.Abstractions;
 using Hemi.Application.Workflows.Definitions.OrderFulfillment;
 using Hemi.Application.Workflows.Execution;
 using Hemi.Application.Workflows.Registry;
 using Hemi.Domain;
 using Hemi.Domain.Workflows;
+using Hemi.Infrastructure;
 using Hemi.Infrastructure.WorkflowPersistence.Entities;
 using Hemi.Infrastructure.WorkflowPersistence.Repositories;
 using Microsoft.AspNetCore.Hosting;
@@ -23,6 +26,24 @@ namespace Hemi.Tests.Infrastructure.WorkflowPersistence;
 
 public sealed class SqlServerWorkflowPersistenceTests
 {
+    private static readonly Guid CompensationWorkflowTableId =
+        Guid.Parse("20000000-0000-0000-0000-000000000002");
+
+    private static readonly Guid CompensationWorkflowMenuItemId =
+        Guid.Parse("30000000-0000-0000-0000-000000000002");
+
+    private static readonly Guid CompensationWorkflowInventoryItemId =
+        Guid.Parse("40000000-0000-0000-0000-000000000002");
+
+    private static readonly Guid RestartWorkflowTableId =
+        Guid.Parse("20000000-0000-0000-0000-000000000005");
+
+    private static readonly Guid RestartWorkflowMenuItemId =
+        Guid.Parse("30000000-0000-0000-0000-000000000003");
+
+    private static readonly Guid RestartWorkflowInventoryItemId =
+        Guid.Parse("40000000-0000-0000-0000-000000000003");
+
     [SqlServerFact]
     public async Task Workflow_schema_applies_idempotently_and_creates_durable_columns_indexes()
     {
@@ -393,6 +414,301 @@ public sealed class SqlServerWorkflowPersistenceTests
             if (instanceId.HasValue)
             {
                 await database.DeleteWorkflowInstanceAsync(instanceId.Value);
+            }
+        }
+    }
+
+    [SqlServerFact]
+    public async Task Full_fulfillment_workflow_uses_sql_fnb_journal_claim_compensation_and_status_query()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        await database.ApplyFnbSchemaAsync();
+
+        using var factory = new SqlWorkflowApiFactory(
+            database.ConnectionString,
+            useSqlFnb: true);
+        var client = factory.CreateClient();
+        var fnbRepository = new SqlServerFnbRepository(database.ConnectionString);
+        var workflowRepository = new WorkflowInstanceRepository(database.ConnectionString);
+        var logRepository = new WorkflowExecutionLogRepository(database.ConnectionString);
+        var startingStock = await database.GetFnbInventoryQuantityAsync(
+            CompensationWorkflowInventoryItemId);
+        ServiceOrder? order = null;
+        Guid? instanceId = null;
+
+        try
+        {
+            await database.SetFnbTableStatusAsync(
+                CompensationWorkflowTableId,
+                TableStatus.Available);
+            await database.SetFnbInventoryQuantityAsync(
+                CompensationWorkflowInventoryItemId,
+                1m);
+
+            var menuItem = (await fnbRepository.GetMenuItemsAsync())
+                .Single(item => item.Id == CompensationWorkflowMenuItemId);
+            order = await fnbRepository.AddOrderAsync(
+                CompensationWorkflowTableId,
+                [new OrderLine(menuItem.Id, 2, menuItem.Price)]);
+
+            using var startResponse = await PostFulfillmentSagaAsync(
+                client,
+                order.Id,
+                $"full-sql-compensation-{Guid.NewGuid():N}",
+                PaymentMethod.Card,
+                order.TotalAmount);
+
+            Assert.Equal(HttpStatusCode.Accepted, startResponse.StatusCode);
+            instanceId = await ReadWorkflowInstanceIdAsync(startResponse);
+
+            var claimed = Assert.Single(
+                await workflowRepository.ClaimDueInstancesAsync(
+                    DateTimeOffset.UtcNow,
+                    "sql-full-compensation-worker",
+                    TimeSpan.FromMinutes(5),
+                    batchSize: 1));
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => DispatchClaimedAsync(factory.Services, claimed));
+
+            Assert.Equal(
+                "Insufficient inventory for 'Grilled Lobster Tail'.",
+                exception.Message);
+
+            var persisted = await workflowRepository.GetInstanceByIdAsync(claimed.Id);
+
+            Assert.NotNull(persisted);
+            Assert.Equal(WorkflowState.Compensated, persisted.State);
+            Assert.Null(persisted.LeaseOwner);
+            Assert.Null(persisted.LeaseUntilUtc);
+
+            var attempts = await logRepository.GetStepAttemptsAsync(claimed.Id);
+            Assert.Contains(
+                attempts,
+                attempt =>
+                    attempt.StepName == "SendOrderToKitchenStep" &&
+                    attempt.Status == WorkflowStepAttemptStatus.Compensated);
+            Assert.Contains(
+                attempts,
+                attempt =>
+                    attempt.StepName == "CaptureOrderPaymentStep" &&
+                    attempt.Status == WorkflowStepAttemptStatus.Compensated);
+            Assert.Contains(
+                attempts,
+                attempt =>
+                    attempt.StepName == "DeductOrderInventoryStep" &&
+                    attempt.Status == WorkflowStepAttemptStatus.Failed);
+
+            var payment = Assert.Single(
+                await fnbRepository.GetPaymentsAsync(),
+                item => item.OrderId == order.Id);
+            Assert.Equal(PaymentStatus.Refunded, payment.Status);
+            Assert.Equal(
+                OrderStatus.Open,
+                (await fnbRepository.GetOrdersAsync())
+                .Single(item => item.Id == order.Id)
+                .Status);
+            Assert.Equal(
+                1m,
+                await database.GetFnbInventoryQuantityAsync(
+                    CompensationWorkflowInventoryItemId));
+
+            using var statusResponse = await client.GetAsync(
+                $"/orders/{order.Id:D}/fulfillment-saga");
+
+            Assert.Equal(HttpStatusCode.OK, statusResponse.StatusCode);
+            using var statusPayload = await ReadJsonAsync(statusResponse);
+            var root = statusPayload.RootElement;
+
+            Assert.Equal(instanceId.Value, root.GetProperty("workflowInstanceId").GetGuid());
+            Assert.Equal(WorkflowIds.OrderFulfillment, root.GetProperty("workflowId").GetString());
+            Assert.Equal((int)WorkflowState.Compensated, root.GetProperty("state").GetInt32());
+            Assert.NotEmpty(root.GetProperty("steps").EnumerateArray());
+        }
+        finally
+        {
+            await database.SetFnbTableStatusAsync(
+                CompensationWorkflowTableId,
+                TableStatus.Available);
+            await database.SetFnbInventoryQuantityAsync(
+                CompensationWorkflowInventoryItemId,
+                startingStock);
+
+            if (instanceId.HasValue)
+            {
+                await database.DeleteWorkflowInstanceAsync(instanceId.Value);
+            }
+
+            if (order is not null)
+            {
+                await database.DeleteFnbOrderAsync(order.Id);
+            }
+        }
+    }
+
+    [SqlServerFact]
+    public async Task Process_restart_reclaims_due_work_and_completes_from_sql_state()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        await database.ApplyFnbSchemaAsync();
+
+        var fnbRepository = new SqlServerFnbRepository(database.ConnectionString);
+        var startingStock = await database.GetFnbInventoryQuantityAsync(
+            RestartWorkflowInventoryItemId);
+        ServiceOrder? order = null;
+        Guid? instanceId = null;
+
+        try
+        {
+            await database.SetFnbTableStatusAsync(
+                RestartWorkflowTableId,
+                TableStatus.Available);
+            await database.SetFnbInventoryQuantityAsync(
+                RestartWorkflowInventoryItemId,
+                10m);
+
+            var menuItem = (await fnbRepository.GetMenuItemsAsync())
+                .Single(item => item.Id == RestartWorkflowMenuItemId);
+            order = await fnbRepository.AddOrderAsync(
+                RestartWorkflowTableId,
+                [new OrderLine(menuItem.Id, 2, menuItem.Price)]);
+
+            using (var initialFactory = new SqlWorkflowApiFactory(
+                       database.ConnectionString,
+                       useSqlFnb: true))
+            {
+                var initialClient = initialFactory.CreateClient();
+                using var startResponse = await PostFulfillmentSagaAsync(
+                    initialClient,
+                    order.Id,
+                    $"restart-sql-{Guid.NewGuid():N}",
+                    PaymentMethod.EWallet,
+                    order.TotalAmount);
+
+                Assert.Equal(HttpStatusCode.Accepted, startResponse.StatusCode);
+                instanceId = await ReadWorkflowInstanceIdAsync(startResponse);
+            }
+
+            using var restartedFactory = new SqlWorkflowApiFactory(
+                database.ConnectionString,
+                useSqlFnb: true);
+            var restartedStore =
+                restartedFactory.Services.GetRequiredService<IWorkflowInstanceStore>();
+
+            var claimed = Assert.Single(
+                await restartedStore.ClaimDueInstancesAsync(
+                    DateTimeOffset.UtcNow,
+                    "sql-restarted-worker",
+                    TimeSpan.FromMinutes(5),
+                    batchSize: 1));
+
+            Assert.Equal(instanceId.Value, claimed.Id);
+
+            await DispatchClaimedAsync(restartedFactory.Services, claimed);
+
+            var persisted = await restartedStore.GetInstanceByIdAsync(instanceId.Value);
+            Assert.NotNull(persisted);
+            Assert.Equal(WorkflowState.Succeeded, persisted.State);
+            Assert.Null(persisted.LeaseOwner);
+            Assert.Null(persisted.LeaseUntilUtc);
+
+            var restartedFnb = new SqlServerFnbRepository(database.ConnectionString);
+            var completedOrder = (await restartedFnb.GetOrdersAsync())
+                .Single(item => item.Id == order.Id);
+
+            Assert.Equal(OrderStatus.Completed, completedOrder.Status);
+            Assert.Equal(
+                8m,
+                await database.GetFnbInventoryQuantityAsync(
+                    RestartWorkflowInventoryItemId));
+            Assert.Single(
+                await restartedFnb.GetPaymentsAsync(),
+                payment =>
+                    payment.OrderId == order.Id &&
+                    payment.Status == PaymentStatus.Settled);
+
+            var attempts = await new WorkflowExecutionLogRepository(database.ConnectionString)
+                .GetStepAttemptsAsync(instanceId.Value);
+
+            Assert.Equal(4, attempts.Count(attempt => attempt.Status == WorkflowStepAttemptStatus.Succeeded));
+        }
+        finally
+        {
+            await database.SetFnbTableStatusAsync(
+                RestartWorkflowTableId,
+                TableStatus.Available);
+            await database.SetFnbInventoryQuantityAsync(
+                RestartWorkflowInventoryItemId,
+                startingStock);
+
+            if (instanceId.HasValue)
+            {
+                await database.DeleteWorkflowInstanceAsync(instanceId.Value);
+            }
+
+            if (order is not null)
+            {
+                await database.DeleteFnbOrderAsync(order.Id);
+            }
+        }
+    }
+
+    [SqlServerFact]
+    public async Task Legacy_saga_is_query_only_and_workflow_status_wins_when_both_records_exist()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        await database.ApplyLegacySagaSchemaAsync();
+
+        using var factory = new SqlWorkflowApiFactory(
+            database.ConnectionString,
+            useSqlLegacySaga: true);
+        var client = factory.CreateClient();
+        var repository = new WorkflowInstanceRepository(database.ConnectionString);
+        var orderId = Guid.NewGuid();
+        WorkflowInstanceRecord? instance = null;
+        Guid? sagaId = null;
+
+        try
+        {
+            var started = await repository.StartWorkflowAsync(
+                CreateStartRequest(
+                    orderId.ToString("D"),
+                    $"workflow-wins-{Guid.NewGuid():N}",
+                    new string('d', 64)));
+
+            instance = started.Instance
+                ?? throw new InvalidOperationException("Expected workflow instance.");
+            sagaId = await database.InsertLegacySagaAsync(orderId);
+
+            Assert.Contains(
+                typeof(ISagaStateQueryPort),
+                typeof(SqlServerSagaStateAdapter).GetInterfaces());
+            Assert.Null(
+                typeof(SqlServerSagaStateAdapter).GetMethod(
+                    "SaveOrderFulfillmentSagaAsync"));
+
+            using var statusResponse = await client.GetAsync(
+                $"/orders/{orderId:D}/fulfillment-saga");
+
+            Assert.Equal(HttpStatusCode.OK, statusResponse.StatusCode);
+            using var payload = await ReadJsonAsync(statusResponse);
+            var root = payload.RootElement;
+
+            Assert.Equal(instance.Id, root.GetProperty("workflowInstanceId").GetGuid());
+            Assert.Equal(WorkflowIds.OrderFulfillment, root.GetProperty("workflowId").GetString());
+            Assert.Equal(orderId.ToString("D"), root.GetProperty("correlationId").GetString());
+            Assert.False(root.TryGetProperty("sagaId", out _));
+        }
+        finally
+        {
+            if (instance is not null)
+            {
+                await database.DeleteWorkflowInstanceAsync(instance.Id);
+            }
+
+            if (sagaId.HasValue)
+            {
+                await database.DeleteLegacySagaAsync(sagaId.Value);
             }
         }
     }
@@ -792,6 +1108,112 @@ public sealed class SqlServerWorkflowPersistenceTests
             Assert.Contains(@"""stepOne"":true", persisted.PayloadJson, StringComparison.Ordinal);
             Assert.Contains(@"""stepTwo"":true", persisted.PayloadJson, StringComparison.Ordinal);
             Assert.Equal(5, persisted.Version);
+        }
+        finally
+        {
+            await database.DeleteWorkflowInstanceAsync(instance.Id);
+        }
+    }
+
+    [SqlServerFact]
+    public async Task Workflow_engine_does_not_duplicate_started_event_when_recovering_existing_attempts()
+    {
+        await using var database = await WorkflowSqlTestDatabase.CreateAsync();
+        var instanceRepository = new WorkflowInstanceRepository(database.ConnectionString);
+        var logRepository = new WorkflowExecutionLogRepository(database.ConnectionString);
+        IWorkflowOutboxStore outboxStore = logRepository;
+        var instance = new WorkflowInstanceEntity
+        {
+            Id = Guid.NewGuid(),
+            CommandId = Guid.NewGuid(),
+            WorkflowId = "sql-start-recovery-workflow",
+            WorkflowName = "SQL Start Recovery Workflow",
+            CorrelationId = Guid.NewGuid().ToString("D"),
+            State = WorkflowState.Running,
+            PayloadJson = """{"source":"start-recovery-test"}""",
+            Attempt = 2,
+            LeaseOwner = "sql-start-recovery-worker",
+            LeaseUntilUtc = DateTimeOffset.UtcNow.AddMinutes(5)
+        };
+
+        try
+        {
+            await instanceRepository.SaveAsync(instance);
+
+            _ = await outboxStore.SaveMessageAsync(
+                new WorkflowOutboxMessageDraft(
+                    instance.Id,
+                    WorkflowEvents.WorkflowStarted,
+                    "workflow.events",
+                    """{"eventName":"workflow.started"}""",
+                    CreatedAtUtc: DateTimeOffset.UtcNow.AddMinutes(-2),
+                    NextAttemptAtUtc: DateTimeOffset.UtcNow.AddMinutes(-2)));
+
+            _ = await logRepository.MarkStepRunningAsync(
+                new WorkflowStepAttemptStart(
+                    instance.Id,
+                    nameof(SqlFirstPayloadStep),
+                    StepOrder: 1,
+                    Attempt: 1,
+                    instance.CommandId,
+                    DateTimeOffset.UtcNow.AddMinutes(-1)));
+            _ = await logRepository.MarkStepSucceededAsync(
+                instance.Id,
+                stepOrder: 1,
+                attempt: 1,
+                DateTimeOffset.UtcNow.AddSeconds(-30));
+
+            var services = new ServiceCollection();
+            services.AddSingleton<IWorkflowInstanceStore>(instanceRepository);
+            services.AddSingleton<IWorkflowExecutionLogStore>(logRepository);
+            services.AddSingleton<IWorkflowJournal>(
+                new SqlServerWorkflowJournal(database.ConnectionString));
+            services.AddTransient<SqlFirstPayloadStep>();
+            services.AddTransient<SqlSecondPayloadStep>();
+
+            var saved = await instanceRepository.GetByIdAsync(instance.Id)
+                ?? throw new InvalidOperationException("Expected saved workflow instance.");
+            var engine = CreateSqlTestEngine(services, instance.WorkflowId);
+            var context = new WorkflowContext(
+                instance.WorkflowId,
+                instance.CorrelationId)
+            {
+                WorkflowInstanceId = instance.Id,
+                WorkflowInstanceVersion = saved.Version,
+                WorkflowAttempt = saved.Attempt,
+                WorkflowLeaseOwner = saved.LeaseOwner,
+                CommandId = saved.CommandId
+            };
+            context.Set("source", "start-recovery-test");
+
+            await engine.ExecuteAsync(
+                instance.WorkflowId,
+                WorkflowDefinition.Create(
+                    instance.WorkflowName,
+                    typeof(SqlFirstPayloadStep),
+                    typeof(SqlSecondPayloadStep)),
+                context);
+
+            var messages = await logRepository.GetMessagesForWorkflowAsync(instance.Id);
+
+            Assert.Single(
+                messages,
+                message => message.MessageType == WorkflowEvents.WorkflowStarted);
+            Assert.Contains(
+                messages,
+                message => message.MessageType == WorkflowEvents.WorkflowSucceeded);
+
+            var attempts = await logRepository.GetStepAttemptsAsync(instance.Id);
+            Assert.Contains(
+                attempts,
+                attempt =>
+                    attempt.StepName == nameof(SqlFirstPayloadStep) &&
+                    attempt.Status == WorkflowStepAttemptStatus.Succeeded);
+            Assert.Contains(
+                attempts,
+                attempt =>
+                    attempt.StepName == nameof(SqlSecondPayloadStep) &&
+                    attempt.Status == WorkflowStepAttemptStatus.Succeeded);
         }
         finally
         {
@@ -1879,6 +2301,45 @@ public sealed class SqlServerWorkflowPersistenceTests
             retryPolicyProvider);
     }
 
+    private static async Task DispatchClaimedAsync(
+        IServiceProvider services,
+        WorkflowInstanceRecord instance)
+    {
+        using var scope = services.CreateScope();
+        var dispatcher = scope.ServiceProvider.GetRequiredService<IWorkflowDispatcher>();
+
+        await dispatcher.DispatchAsync(
+            instance.WorkflowId,
+            CreateWorkerContext(instance));
+    }
+
+    private static WorkflowContext CreateWorkerContext(
+        WorkflowInstanceRecord instance)
+    {
+        var context = new WorkflowContext(
+            instance.WorkflowId,
+            instance.CorrelationId)
+        {
+            WorkflowInstanceId = instance.Id,
+            WorkflowInstanceVersion = instance.Version,
+            WorkflowAttempt = instance.Attempt,
+            WorkflowLeaseOwner = instance.LeaseOwner,
+            CommandId = instance.CommandId,
+            State = instance.State
+        };
+
+        if (!string.IsNullOrWhiteSpace(instance.PayloadJson))
+        {
+            using var document = JsonDocument.Parse(instance.PayloadJson);
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                context.Set(property.Name, property.Value.Clone());
+            }
+        }
+
+        return context;
+    }
+
     private static Task<HttpResponseMessage> PostFulfillmentSagaAsync(
         HttpClient client,
         Guid orderId,
@@ -2007,7 +2468,10 @@ public sealed class SqlServerWorkflowPersistenceTests
         return [.. names];
     }
 
-    private sealed class SqlWorkflowApiFactory(string connectionString)
+    private sealed class SqlWorkflowApiFactory(
+        string connectionString,
+        bool useSqlFnb = false,
+        bool useSqlLegacySaga = false)
         : WebApplicationFactory<Program>
     {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
@@ -2022,6 +2486,8 @@ public sealed class SqlServerWorkflowPersistenceTests
                 services.RemoveAll<IWorkflowExecutionLogStore>();
                 services.RemoveAll<IWorkflowOutboxStore>();
                 services.RemoveAll<IWorkflowJournal>();
+                services.RemoveAll<WorkflowPolicyRegistration>();
+                services.RemoveAll<IRetryPolicyProvider>();
 
                 services.AddSingleton(_ => new WorkflowInstanceRepository(connectionString));
                 services.AddSingleton<IWorkflowInstanceStore>(sp =>
@@ -2033,7 +2499,73 @@ public sealed class SqlServerWorkflowPersistenceTests
                     sp.GetRequiredService<WorkflowExecutionLogRepository>());
                 services.AddSingleton<IWorkflowJournal>(_ =>
                     new SqlServerWorkflowJournal(connectionString));
+                services.AddSingleton(new WorkflowPolicyRegistration(
+                    WorkflowIds.OrderFulfillment,
+                    WorkflowPolicies.NoRetry));
+                services.AddSingleton(new WorkflowPolicyRegistration(
+                    WorkflowIds.OrderCancellation,
+                    WorkflowPolicies.NoRetry));
+                services.AddSingleton(new WorkflowPolicyRegistration(
+                    WorkflowIds.InventoryReconciliation,
+                    WorkflowPolicies.NoRetry));
+                services.AddSingleton<IRetryPolicyProvider, RetryPolicyProvider>();
+
+                if (useSqlFnb)
+                {
+                    AddSqlFnbPersistence(services, connectionString);
+                }
+
+                if (useSqlLegacySaga)
+                {
+                    services.RemoveAll<SqlServerSagaStateAdapter>();
+                    services.RemoveAll<ISagaStateQueryPort>();
+                    services.AddSingleton(_ => new SqlServerSagaStateAdapter(connectionString));
+                    services.AddSingleton<ISagaStateQueryPort>(sp =>
+                        sp.GetRequiredService<SqlServerSagaStateAdapter>());
+                }
             });
+        }
+
+        private static void AddSqlFnbPersistence(
+            IServiceCollection services,
+            string connectionString)
+        {
+            services.RemoveAll<SqlServerFnbRepository>();
+            services.RemoveAll<IRestaurantQueryPort>();
+            services.RemoveAll<ITableQueryPort>();
+            services.RemoveAll<IMenuQueryPort>();
+            services.RemoveAll<IOrderQueryPort>();
+            services.RemoveAll<IOrderCommandPort>();
+            services.RemoveAll<IReservationQueryPort>();
+            services.RemoveAll<IReservationCommandPort>();
+            services.RemoveAll<IPaymentQueryPort>();
+            services.RemoveAll<IPaymentCommandPort>();
+            services.RemoveAll<IInventoryQueryPort>();
+            services.RemoveAll<IInventoryCommandPort>();
+
+            services.AddSingleton(_ => new SqlServerFnbRepository(connectionString));
+            services.AddSingleton<IRestaurantQueryPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
+            services.AddSingleton<ITableQueryPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
+            services.AddSingleton<IMenuQueryPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
+            services.AddSingleton<IOrderQueryPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
+            services.AddSingleton<IOrderCommandPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
+            services.AddSingleton<IReservationQueryPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
+            services.AddSingleton<IReservationCommandPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
+            services.AddSingleton<IPaymentQueryPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
+            services.AddSingleton<IPaymentCommandPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
+            services.AddSingleton<IInventoryQueryPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
+            services.AddSingleton<IInventoryCommandPort>(sp =>
+                sp.GetRequiredService<SqlServerFnbRepository>());
         }
     }
 
@@ -2101,18 +2633,199 @@ public sealed class SqlServerWorkflowPersistenceTests
             }
         }
 
+        public async Task DeleteFnbOrderAsync(Guid orderId)
+        {
+            await using var connection = new SqlConnection(ConnectionString);
+            await connection.OpenAsync();
+
+            foreach (var sql in new[]
+            {
+                "DELETE FROM dbo.FnbStockMovement WHERE OrderId = @OrderId;",
+                "DELETE FROM dbo.FnbPayment WHERE OrderId = @OrderId;",
+                "DELETE FROM dbo.FnbOrderLine WHERE OrderId = @OrderId;",
+                "DELETE FROM dbo.FnbServiceOrder WHERE Id = @OrderId;"
+            })
+            {
+                await using var command = new SqlCommand(sql, connection);
+                _ = command.Parameters.Add("@OrderId", SqlDbType.UniqueIdentifier).Value =
+                    orderId;
+                _ = await command.ExecuteNonQueryAsync();
+            }
+        }
+
+        public async Task DeleteLegacySagaAsync(Guid sagaId)
+        {
+            await using var connection = new SqlConnection(ConnectionString);
+            await connection.OpenAsync();
+
+            foreach (var sql in new[]
+            {
+                "DELETE FROM dbo.OutboxMessage WHERE SagaInstanceId = @SagaId;",
+                "DELETE FROM dbo.SagaStep WHERE SagaInstanceId = @SagaId;",
+                "DELETE FROM dbo.SagaInstance WHERE Id = @SagaId;"
+            })
+            {
+                await using var command = new SqlCommand(sql, connection);
+                _ = command.Parameters.Add("@SagaId", SqlDbType.UniqueIdentifier).Value =
+                    sagaId;
+                _ = await command.ExecuteNonQueryAsync();
+            }
+        }
+
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 
-        public async Task ApplySchemaAsync()
-        {
-            var schemaPath = Path.Combine(
-                FindRepositoryRoot(),
+        public Task ApplySchemaAsync() =>
+            ApplySqlScriptAsync(
                 "src",
                 "Infrastructure",
                 "WorkflowPersistence",
                 "Sql",
                 "WorkflowTables.sql");
 
+        public Task ApplyFnbSchemaAsync() =>
+            ApplySqlScriptAsync(
+                "src",
+                "Infrastructure",
+                "FnbPersistence",
+                "Sql",
+                "FnbTables.sql");
+
+        public Task ApplyLegacySagaSchemaAsync() =>
+            ApplySqlScriptAsync(
+                "src",
+                "Infrastructure",
+                "Persistence",
+                "SagaCoreTables.sql");
+
+        public async Task<decimal> GetFnbInventoryQuantityAsync(
+            Guid inventoryItemId)
+        {
+            await using var connection = new SqlConnection(ConnectionString);
+            await connection.OpenAsync();
+
+            const string sql = """
+                SELECT StockQuantity
+                FROM dbo.FnbInventoryItem
+                WHERE Id = @InventoryItemId;
+                """;
+
+            await using var command = new SqlCommand(sql, connection);
+            _ = command.Parameters.Add("@InventoryItemId", SqlDbType.UniqueIdentifier).Value =
+                inventoryItemId;
+
+            var result = await command.ExecuteScalarAsync()
+                ?? throw new InvalidOperationException("Inventory item not found.");
+
+            return (decimal)result;
+        }
+
+        public async Task SetFnbInventoryQuantityAsync(
+            Guid inventoryItemId,
+            decimal stockQuantity)
+        {
+            await using var connection = new SqlConnection(ConnectionString);
+            await connection.OpenAsync();
+
+            const string sql = """
+                UPDATE dbo.FnbInventoryItem
+                SET StockQuantity = @StockQuantity
+                WHERE Id = @InventoryItemId;
+                """;
+
+            await using var command = new SqlCommand(sql, connection);
+            _ = command.Parameters.Add("@InventoryItemId", SqlDbType.UniqueIdentifier).Value =
+                inventoryItemId;
+            var stockParameter = command.Parameters.Add("@StockQuantity", SqlDbType.Decimal);
+            stockParameter.Precision = 18;
+            stockParameter.Scale = 3;
+            stockParameter.Value = stockQuantity;
+            _ = await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task SetFnbTableStatusAsync(
+            Guid tableId,
+            TableStatus status)
+        {
+            await using var connection = new SqlConnection(ConnectionString);
+            await connection.OpenAsync();
+
+            const string sql = """
+                UPDATE dbo.FnbDiningTable
+                SET Status = @Status
+                WHERE Id = @TableId;
+                """;
+
+            await using var command = new SqlCommand(sql, connection);
+            _ = command.Parameters.Add("@TableId", SqlDbType.UniqueIdentifier).Value =
+                tableId;
+            _ = command.Parameters.Add("@Status", SqlDbType.NVarChar, 32).Value =
+                status.ToString();
+            _ = await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task<Guid> InsertLegacySagaAsync(Guid orderId)
+        {
+            var sagaId = Guid.NewGuid();
+            var now = DateTimeOffset.UtcNow.AddMinutes(-5);
+            var payloadJson = JsonSerializer.Serialize(
+                new SagaMessageEnvelope(
+                    orderId,
+                    sagaId,
+                    OrderFulfillmentSagaStatus.Completed,
+                    SagaStepStatus.Completed,
+                    SagaStepStatus.Completed,
+                    SagaStepStatus.Completed,
+                    SagaStepStatus.Completed,
+                    LastError: null,
+                    UpdatedAt: now,
+                    StartedAt: now));
+
+            await using var connection = new SqlConnection(ConnectionString);
+            await connection.OpenAsync();
+
+            const string sql = """
+                INSERT dbo.SagaInstance (
+                    Id, SagaType, CorrelationId, CurrentStep, Status,
+                    PayloadJson, Version, CreatedAt, UpdatedAt)
+                VALUES (
+                    @Id, @SagaType, @CorrelationId, @CurrentStep, @Status,
+                    @PayloadJson, @Version, @CreatedAt, @UpdatedAt);
+                """;
+
+            await using var command = new SqlCommand(sql, connection);
+            _ = command.Parameters.Add("@Id", SqlDbType.UniqueIdentifier).Value = sagaId;
+            _ = command.Parameters.Add("@SagaType", SqlDbType.NVarChar, 128).Value =
+                "OrderFulfillmentSaga";
+            _ = command.Parameters.Add("@CorrelationId", SqlDbType.UniqueIdentifier).Value =
+                orderId;
+            _ = command.Parameters.Add("@CurrentStep", SqlDbType.NVarChar, 128).Value =
+                "Done";
+            _ = command.Parameters.Add("@Status", SqlDbType.NVarChar, 32).Value =
+                SagaInstanceStatus.Completed.ToString();
+            _ = command.Parameters.Add("@PayloadJson", SqlDbType.NVarChar, -1).Value =
+                payloadJson;
+            _ = command.Parameters.Add("@Version", SqlDbType.Int).Value = 1;
+            _ = command.Parameters.Add("@CreatedAt", SqlDbType.DateTimeOffset).Value =
+                now;
+            _ = command.Parameters.Add("@UpdatedAt", SqlDbType.DateTimeOffset).Value =
+                now;
+            _ = await command.ExecuteNonQueryAsync();
+
+            return sagaId;
+        }
+
+        private async Task ApplySqlScriptAsync(params string[] relativePathParts)
+        {
+            var pathParts = new string[relativePathParts.Length + 1];
+            pathParts[0] = FindRepositoryRoot();
+            Array.Copy(
+                relativePathParts,
+                sourceIndex: 0,
+                pathParts,
+                destinationIndex: 1,
+                relativePathParts.Length);
+
+            var schemaPath = Path.Combine(pathParts);
             var schemaSql = await File.ReadAllTextAsync(schemaPath);
 
             await using var connection = new SqlConnection(ConnectionString);
@@ -2129,7 +2842,7 @@ public sealed class SqlServerWorkflowPersistenceTests
         {
             var batch = new StringBuilder();
 
-            foreach (var line in sql.Split(Environment.NewLine))
+            foreach (var line in sql.Replace("\r\n", "\n").Split('\n'))
             {
                 if (string.Equals(line.Trim(), "GO", StringComparison.OrdinalIgnoreCase))
                 {

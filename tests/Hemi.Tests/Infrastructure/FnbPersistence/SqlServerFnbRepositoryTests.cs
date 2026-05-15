@@ -14,8 +14,14 @@ public sealed class SqlServerFnbRepositoryTests
     private static readonly Guid SeedMenuItemId =
         Guid.Parse("30000000-0000-0000-0000-000000000001");
 
+    private static readonly Guid SecondSeedMenuItemId =
+        Guid.Parse("30000000-0000-0000-0000-000000000002");
+
     private static readonly Guid SeedInventoryItemId =
         Guid.Parse("40000000-0000-0000-0000-000000000001");
+
+    private static readonly Guid SecondSeedInventoryItemId =
+        Guid.Parse("40000000-0000-0000-0000-000000000002");
 
     private static readonly Guid SeedReservationId =
         Guid.Parse("50000000-0000-0000-0000-000000000001");
@@ -26,6 +32,12 @@ public sealed class SqlServerFnbRepositoryTests
         await using var database = await FnbSqlTestDatabase.CreateAsync();
         await database.ApplySchemaAsync();
         await database.ApplySchemaAsync();
+
+        Assert.Equal(1, await database.GetRowCountAsync("FnbRestaurantProfile"));
+        Assert.Equal(12, await database.GetRowCountAsync("FnbDiningTable"));
+        Assert.Equal(7, await database.GetRowCountAsync("FnbMenuItem"));
+        Assert.Equal(7, await database.GetRowCountAsync("FnbInventoryItem"));
+        Assert.Equal(2, await database.GetRowCountAsync("FnbReservation"));
 
         var paymentColumns = await GetColumnNamesAsync(
             database.ConnectionString,
@@ -156,6 +168,203 @@ public sealed class SqlServerFnbRepositoryTests
         }
     }
 
+    [SqlServerFact]
+    public async Task Repository_persists_order_create_update_and_status_across_instances()
+    {
+        await using var database = await FnbSqlTestDatabase.CreateAsync();
+        var writer = new SqlServerFnbRepository(database.ConnectionString);
+        var reader = new SqlServerFnbRepository(database.ConnectionString);
+        var table = (await writer.GetTablesAsync())
+            .Single(item => item.Id == SeedTableId);
+        var menuItem = (await writer.GetMenuItemsAsync())
+            .Single(item => item.Id == SeedMenuItemId);
+        ServiceOrder? order = null;
+
+        try
+        {
+            await database.SetTableStatusAsync(table.Id, TableStatus.Available);
+
+            order = await writer.AddOrderAsync(
+                table.Id,
+                [new OrderLine(menuItem.Id, 1, menuItem.Price)]);
+
+            var createdFromReader = (await reader.GetOrdersAsync())
+                .Single(item => item.Id == order.Id);
+
+            Assert.Equal(OrderStatus.Open, createdFromReader.Status);
+            Assert.Equal(1, Assert.Single(createdFromReader.Lines).Quantity);
+            Assert.Equal(
+                TableStatus.Occupied,
+                (await reader.GetTablesAsync())
+                .Single(item => item.Id == table.Id)
+                .Status);
+
+            _ = await reader.UpdateOrderLinesAsync(
+                order.Id,
+                [new OrderLine(menuItem.Id, 3, menuItem.Price)]);
+
+            var updatedLinesFromWriter = (await writer.GetOrdersAsync())
+                .Single(item => item.Id == order.Id);
+
+            Assert.Equal(3, Assert.Single(updatedLinesFromWriter.Lines).Quantity);
+
+            _ = await writer.UpdateOrderStatusAsync(
+                order.Id,
+                OrderStatus.SentToKitchen);
+
+            Assert.Equal(
+                OrderStatus.SentToKitchen,
+                (await reader.GetOrdersAsync())
+                .Single(item => item.Id == order.Id)
+                .Status);
+
+            _ = await reader.UpdateOrderStatusAsync(
+                order.Id,
+                OrderStatus.Completed);
+
+            Assert.Equal(
+                OrderStatus.Completed,
+                (await writer.GetOrdersAsync())
+                .Single(item => item.Id == order.Id)
+                .Status);
+            Assert.Equal(
+                TableStatus.Available,
+                (await writer.GetTablesAsync())
+                .Single(item => item.Id == table.Id)
+                .Status);
+        }
+        finally
+        {
+            await database.SetTableStatusAsync(table.Id, TableStatus.Available);
+
+            if (order is not null)
+            {
+                await database.DeleteOrderAsync(order.Id);
+            }
+        }
+    }
+
+    [SqlServerFact]
+    public async Task Repository_adds_payments_and_refunds_idempotently()
+    {
+        await using var database = await FnbSqlTestDatabase.CreateAsync();
+        var firstRepository = new SqlServerFnbRepository(database.ConnectionString);
+        var secondRepository = new SqlServerFnbRepository(database.ConnectionString);
+        var table = (await firstRepository.GetTablesAsync())
+            .Single(item => item.Id == SeedTableId);
+        var menuItem = (await firstRepository.GetMenuItemsAsync())
+            .Single(item => item.Id == SeedMenuItemId);
+        ServiceOrder? order = null;
+
+        try
+        {
+            await database.SetTableStatusAsync(table.Id, TableStatus.Available);
+
+            order = await firstRepository.AddOrderAsync(
+                table.Id,
+                [new OrderLine(menuItem.Id, 1, menuItem.Price)]);
+
+            var firstPayment = await firstRepository.AddPaymentAsync(
+                order.Id,
+                order.TotalAmount,
+                PaymentMethod.Card);
+            var retryPayment = await secondRepository.AddPaymentAsync(
+                order.Id,
+                order.TotalAmount,
+                PaymentMethod.EWallet);
+
+            Assert.Equal(firstPayment.Id, retryPayment.Id);
+            Assert.Equal(PaymentMethod.Card, retryPayment.Method);
+
+            var firstRefund = await firstRepository.RefundPaymentsForOrderAsync(order.Id);
+            var retryRefund = await secondRepository.RefundPaymentsForOrderAsync(order.Id);
+
+            var refunded = Assert.Single(firstRefund);
+            Assert.Equal(firstPayment.Id, refunded.Id);
+            Assert.Equal(PaymentStatus.Refunded, refunded.Status);
+            Assert.Empty(retryRefund);
+
+            var persistedPayments = (await firstRepository.GetPaymentsAsync())
+                .Where(payment => payment.OrderId == order.Id)
+                .ToArray();
+
+            var persistedPayment = Assert.Single(persistedPayments);
+            Assert.Equal(firstPayment.Id, persistedPayment.Id);
+            Assert.Equal(PaymentStatus.Refunded, persistedPayment.Status);
+        }
+        finally
+        {
+            await database.SetTableStatusAsync(table.Id, TableStatus.Available);
+
+            if (order is not null)
+            {
+                await database.DeleteOrderAsync(order.Id);
+            }
+        }
+    }
+
+    [SqlServerFact]
+    public async Task Repository_rolls_back_inventory_deduction_when_stock_is_insufficient()
+    {
+        await using var database = await FnbSqlTestDatabase.CreateAsync();
+        var repository = new SqlServerFnbRepository(database.ConnectionString);
+        var table = (await repository.GetTablesAsync())
+            .Single(item => item.Id == SeedTableId);
+        var menu = await repository.GetMenuItemsAsync();
+        var firstMenuItem = menu.Single(item => item.Id == SeedMenuItemId);
+        var secondMenuItem = menu.Single(item => item.Id == SecondSeedMenuItemId);
+        var firstStartingStock = await database.GetInventoryQuantityAsync(
+            SeedInventoryItemId);
+        var secondStartingStock = await database.GetInventoryQuantityAsync(
+            SecondSeedInventoryItemId);
+        ServiceOrder? order = null;
+
+        try
+        {
+            await database.SetTableStatusAsync(table.Id, TableStatus.Available);
+            await database.SetInventoryQuantityAsync(SeedInventoryItemId, 10m);
+            await database.SetInventoryQuantityAsync(SecondSeedInventoryItemId, 1m);
+
+            order = await repository.AddOrderAsync(
+                table.Id,
+                [
+                    new OrderLine(firstMenuItem.Id, 1, firstMenuItem.Price),
+                    new OrderLine(secondMenuItem.Id, 2, secondMenuItem.Price)
+                ]);
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => repository.DeductInventoryForOrderAsync(order.Id));
+
+            Assert.Equal(
+                "Insufficient inventory for 'Grilled Lobster Tail'.",
+                exception.Message);
+            Assert.Equal(
+                10m,
+                await database.GetInventoryQuantityAsync(SeedInventoryItemId));
+            Assert.Equal(
+                1m,
+                await database.GetInventoryQuantityAsync(SecondSeedInventoryItemId));
+            Assert.Equal(
+                0,
+                await database.GetStockMovementCountAsync(order.Id));
+        }
+        finally
+        {
+            await database.SetTableStatusAsync(table.Id, TableStatus.Available);
+            await database.SetInventoryQuantityAsync(
+                SeedInventoryItemId,
+                firstStartingStock);
+            await database.SetInventoryQuantityAsync(
+                SecondSeedInventoryItemId,
+                secondStartingStock);
+
+            if (order is not null)
+            {
+                await database.DeleteOrderAsync(order.Id);
+            }
+        }
+    }
+
     private static async Task<HashSet<string>> GetColumnNamesAsync(
         string connectionString,
         string tableName)
@@ -278,6 +487,19 @@ public sealed class SqlServerFnbRepositoryTests
             }
         }
 
+        public async Task<int> GetRowCountAsync(string tableName)
+        {
+            await using var connection = new SqlConnection(ConnectionString);
+            await connection.OpenAsync();
+
+            var sql = $"SELECT COUNT_BIG(*) FROM dbo.{tableName};";
+            await using var command = new SqlCommand(sql, connection);
+            var result = await command.ExecuteScalarAsync()
+                ?? throw new InvalidOperationException("Count query returned no result.");
+
+            return Convert.ToInt32(result);
+        }
+
         public async Task<decimal> GetInventoryQuantityAsync(Guid inventoryItemId)
         {
             await using var connection = new SqlConnection(ConnectionString);
@@ -340,6 +562,27 @@ public sealed class SqlServerFnbRepositoryTests
             _ = command.Parameters.Add("@Status", SqlDbType.NVarChar, 32).Value =
                 status.ToString();
             _ = await command.ExecuteNonQueryAsync();
+        }
+
+        public async Task<int> GetStockMovementCountAsync(Guid orderId)
+        {
+            await using var connection = new SqlConnection(ConnectionString);
+            await connection.OpenAsync();
+
+            const string sql = """
+                SELECT COUNT_BIG(*)
+                FROM dbo.FnbStockMovement
+                WHERE OrderId = @OrderId;
+                """;
+
+            await using var command = new SqlCommand(sql, connection);
+            _ = command.Parameters.Add("@OrderId", SqlDbType.UniqueIdentifier).Value =
+                orderId;
+
+            var result = await command.ExecuteScalarAsync()
+                ?? throw new InvalidOperationException("Count query returned no result.");
+
+            return Convert.ToInt32(result);
         }
 
         public async Task DeleteOrderAsync(Guid orderId)
