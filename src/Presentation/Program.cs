@@ -19,29 +19,20 @@ using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
 
-builder.Services.AddSingleton<InMemoryFnbStore>();
-builder.Services.AddSingleton<InMemoryRestaurantAdapter>();
-builder.Services.AddSingleton<InMemoryTableAdapter>();
-builder.Services.AddSingleton<InMemoryMenuAdapter>();
-builder.Services.AddSingleton<InMemoryOrderAdapter>();
-builder.Services.AddSingleton<InMemoryReservationAdapter>();
-builder.Services.AddSingleton<InMemoryPaymentAdapter>();
-builder.Services.AddSingleton<InMemoryInventoryAdapter>();
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
     ?? "Server=localhost;Database=HemiFnb;Trusted_Connection=True;TrustServerCertificate=True;";
-builder.Services.AddSingleton(new SqlServerSagaStateAdapter(connectionString));
 
-builder.Services.AddSingleton<IRestaurantQueryPort>(sp => sp.GetRequiredService<InMemoryRestaurantAdapter>());
-builder.Services.AddSingleton<ITableQueryPort>(sp => sp.GetRequiredService<InMemoryTableAdapter>());
-builder.Services.AddSingleton<IMenuQueryPort>(sp => sp.GetRequiredService<InMemoryMenuAdapter>());
-builder.Services.AddSingleton<IOrderQueryPort>(sp => sp.GetRequiredService<InMemoryOrderAdapter>());
-builder.Services.AddSingleton<IOrderCommandPort>(sp => sp.GetRequiredService<InMemoryOrderAdapter>());
-builder.Services.AddSingleton<IReservationQueryPort>(sp => sp.GetRequiredService<InMemoryReservationAdapter>());
-builder.Services.AddSingleton<IReservationCommandPort>(sp => sp.GetRequiredService<InMemoryReservationAdapter>());
-builder.Services.AddSingleton<IPaymentQueryPort>(sp => sp.GetRequiredService<InMemoryPaymentAdapter>());
-builder.Services.AddSingleton<IPaymentCommandPort>(sp => sp.GetRequiredService<InMemoryPaymentAdapter>());
-builder.Services.AddSingleton<IInventoryQueryPort>(sp => sp.GetRequiredService<InMemoryInventoryAdapter>());
-builder.Services.AddSingleton<IInventoryCommandPort>(sp => sp.GetRequiredService<InMemoryInventoryAdapter>());
+if (builder.Environment.IsEnvironment("Testing") ||
+    IsEnabled(builder.Configuration["Fnb:UseInMemory"]))
+{
+    AddInMemoryFnbPersistence(builder.Services);
+}
+else
+{
+    AddSqlServerFnbPersistence(builder.Services, connectionString);
+}
+
+builder.Services.AddSingleton(new SqlServerSagaStateAdapter(connectionString));
 builder.Services.AddSingleton<ISagaStateQueryPort>(sp => sp.GetRequiredService<SqlServerSagaStateAdapter>());
 
 builder.Services.AddSingleton<LegacyOrderFulfillmentSagaQueryService>();
@@ -384,6 +375,74 @@ static string ResolveIdempotencyKey(
     }
 
     return $"{WorkflowIds.OrderFulfillment}:{orderId:D}";
+}
+
+static bool IsEnabled(string? value) =>
+    bool.TryParse(value, out var enabled) && enabled;
+
+static void AddInMemoryFnbPersistence(IServiceCollection services)
+{
+    services.AddSingleton<InMemoryFnbStore>();
+    services.AddSingleton<InMemoryRestaurantAdapter>();
+    services.AddSingleton<InMemoryTableAdapter>();
+    services.AddSingleton<InMemoryMenuAdapter>();
+    services.AddSingleton<InMemoryOrderAdapter>();
+    services.AddSingleton<InMemoryReservationAdapter>();
+    services.AddSingleton<InMemoryPaymentAdapter>();
+    services.AddSingleton<InMemoryInventoryAdapter>();
+
+    services.AddSingleton<IRestaurantQueryPort>(sp =>
+        sp.GetRequiredService<InMemoryRestaurantAdapter>());
+    services.AddSingleton<ITableQueryPort>(sp =>
+        sp.GetRequiredService<InMemoryTableAdapter>());
+    services.AddSingleton<IMenuQueryPort>(sp =>
+        sp.GetRequiredService<InMemoryMenuAdapter>());
+    services.AddSingleton<IOrderQueryPort>(sp =>
+        sp.GetRequiredService<InMemoryOrderAdapter>());
+    services.AddSingleton<IOrderCommandPort>(sp =>
+        sp.GetRequiredService<InMemoryOrderAdapter>());
+    services.AddSingleton<IReservationQueryPort>(sp =>
+        sp.GetRequiredService<InMemoryReservationAdapter>());
+    services.AddSingleton<IReservationCommandPort>(sp =>
+        sp.GetRequiredService<InMemoryReservationAdapter>());
+    services.AddSingleton<IPaymentQueryPort>(sp =>
+        sp.GetRequiredService<InMemoryPaymentAdapter>());
+    services.AddSingleton<IPaymentCommandPort>(sp =>
+        sp.GetRequiredService<InMemoryPaymentAdapter>());
+    services.AddSingleton<IInventoryQueryPort>(sp =>
+        sp.GetRequiredService<InMemoryInventoryAdapter>());
+    services.AddSingleton<IInventoryCommandPort>(sp =>
+        sp.GetRequiredService<InMemoryInventoryAdapter>());
+}
+
+static void AddSqlServerFnbPersistence(
+    IServiceCollection services,
+    string connectionString)
+{
+    services.AddSingleton(_ => new SqlServerFnbRepository(connectionString));
+
+    services.AddSingleton<IRestaurantQueryPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
+    services.AddSingleton<ITableQueryPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
+    services.AddSingleton<IMenuQueryPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
+    services.AddSingleton<IOrderQueryPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
+    services.AddSingleton<IOrderCommandPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
+    services.AddSingleton<IReservationQueryPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
+    services.AddSingleton<IReservationCommandPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
+    services.AddSingleton<IPaymentQueryPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
+    services.AddSingleton<IPaymentCommandPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
+    services.AddSingleton<IInventoryQueryPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
+    services.AddSingleton<IInventoryCommandPort>(sp =>
+        sp.GetRequiredService<SqlServerFnbRepository>());
 }
 
 public sealed record CreateOrderRequest(Guid TableId, IReadOnlyCollection<CreateOrderItemRequest> Items);

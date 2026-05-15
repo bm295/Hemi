@@ -2,6 +2,7 @@
 bin/
 obj/
 out/
+*.lscache
 
 # User-specific files
 *.user
