@@ -13,8 +13,8 @@ This repository now contains a layered C# application for **Hemi Steak & Seafood
 - **.NET 10** (`net10.0`)
 - Layered architecture:
   - Presentation (Minimal API)
-  - Application (use-case service + ports)
-  - Infrastructure (SQL FnB adapters + in-memory test overrides + SQL workflow persistence)
+  - Application (use-case service, workflow runtime, workflow registry, and ports)
+  - Infrastructure (SQL FnB repository, in-memory test overrides, SQL workflow persistence, SQL outbox, and monitoring)
   - Domain (entities and value objects)
 
 ## Features implemented
@@ -33,6 +33,7 @@ This repository now contains a layered C# application for **Hemi Steak & Seafood
 - SQL-backed workflow persistence for instances, step attempts, journaled transitions, and workflow outbox messages
 - Idempotent workflow starts with correlation conflict protection
 - Worker and outbox lease recovery for safe polling across multiple processes
+- Workflow registry/start/status endpoints for generic workflow operations
 - Reservation creation and upcoming reservation listing
 - Inventory snapshot endpoint
 - Basic sales report endpoint
@@ -53,11 +54,10 @@ src/Infrastructure/WorkflowPersistence/Sql/WorkflowTables.sql
 dotnet run --project src/Presentation/Hemi.Presentation.csproj
 ```
 
-FnB ports use `ConnectionStrings:DefaultConnection` by default. For local demos that should not touch SQL Server, set `Fnb:UseInMemory=true`; tests use the in-memory FnB adapters automatically.
+FnB ports use `ConnectionStrings:DefaultConnection` by default. For local demos that should not touch SQL Server, set `Fnb:UseInMemory=true`; the `Testing` environment also uses the in-memory FnB adapters unless a test overrides them.
 
 The API starts locally and exposes endpoints such as:
 
-- `GET /`
 - `GET /tables`
 - `GET /menu`
 - `GET /orders/open`
@@ -74,6 +74,10 @@ The API starts locally and exposes endpoints such as:
 - `GET /reservations/upcoming`
 - `POST /reservations`
 - `POST /integrations/food-app/orders`
+- `GET /workflows/`
+- `GET /workflows/{workflowId}`
+- `POST /workflows/`
+- `GET /workflows/{workflowId}/instances/{correlationId}`
 
 ## Durable order fulfillment
 

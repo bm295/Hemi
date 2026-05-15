@@ -2,155 +2,183 @@
 
 ## 1. Repository Overview
 
-- The repository includes a .NET solution (`Hemi.sln`); the FnB implementation is the C# code under `src/`.
-- The C# projects remain separated as:
-  - `Hemi.Domain`
-  - `Hemi.Application`
-  - `Hemi.Infrastructure`
-  - `Hemi.Presentation`
-- Hexagonal boundaries are explicit in the application layer with:
-  - `Ports/` for outbound port contracts
-  - `UseCases/` for orchestration/use-case services
-  - `Contracts/` for application DTOs
-- Global build settings target `.NET 10` and `C# 14` through `Directory.Build.props`.
-- API endpoints support profile/tables/menu, full order lifecycle, durable order fulfillment workflow orchestration, reservation operations, inventory view, sales reporting, and external food-app order intake.
-- The active order-fulfillment runtime is the durable workflow orchestrator documented in `docs/durable-workflow-orchestrator.md`.
+- The repository is a .NET solution (`Hemi.sln`) with C# implementation under
+  `src/`.
+- Global build settings target `.NET 10` and `C# 14` through
+  `Directory.Build.props`, with nullable reference types and warnings as errors.
+- The project boundaries are:
+  - `Hemi.Domain`: restaurant and workflow domain records/enums.
+  - `Hemi.Application`: use-case orchestration, outbound ports, workflow
+    abstractions, workflow runtime, definitions, policies, and registry.
+  - `Hemi.Infrastructure`: SQL Server FnB persistence, SQL workflow
+    persistence/journal/outbox, in-memory test adapters, messaging, and workflow
+    monitoring.
+  - `Hemi.Presentation`: Minimal API endpoints, DI composition, workflow worker,
+    outbox publisher service, and command queue.
+- The active order-fulfillment runtime is the durable workflow orchestrator
+  documented in `docs/durable-workflow-orchestrator.md`.
 
-## 2. Architecture Evaluation
+## 2. Current Architecture Pattern
 
-### Positive Findings
+The codebase is a layered hexagonal architecture with pragmatic project names:
 
-- Clear layer separation exists at project level (Domain, Application, Infrastructure, Presentation).
-- Application defines granular ports by concern (restaurant/table/menu/order/reservation/inventory/payment).
-- Infrastructure uses dedicated in-memory adapters per restaurant concern with a shared store, instead of a single overloaded repository.
-- Durable workflow infrastructure exists for SQL-backed workflow instances, step attempt history, explicit workflow journaling, worker leases, and outbox publishing.
-- Workflow journal and outbox completion paths now treat leases as fencing tokens, not only polling hints.
-- Presentation depends on application ports/services via DI and keeps endpoint handlers thin.
+- Inbound adapters live in Presentation:
+  Minimal API routes, `/workflows` endpoints, `/orders/{orderId}/fulfillment-saga`
+  compatibility route, `WorkflowWorkerService`, and
+  `WorkflowOutboxPublisherService`.
+- Application owns business orchestration:
+  `FnbManagementService`, outbound port contracts, workflow execution,
+  workflow registry, retry policies, workflow DTOs, and workflow definitions.
+- Infrastructure owns adapter implementations:
+  `SqlServerFnbRepository`, SQL workflow repositories, `SqlServerWorkflowJournal`,
+  outbox publishing, in-memory FnB test adapters, and workflow metrics/tracing.
+- Domain remains framework-free and contains the restaurant/workflow data model.
 
-### Remaining Gaps vs Expected Target Architecture
+Runtime composition in `Program.cs` now uses SQL Server by default for the FnB
+ports. In-memory FnB adapters are selected only in the `Testing` environment or
+when `Fnb:UseInMemory=true`.
 
-- The repository still does not use the explicitly requested package/folder topology (`/src/Adapters`, `/src/Api`, etc.).
-- Use-case logic is still centralized in one orchestration service (`FnbManagementService`) rather than distinct use-case handlers.
-- Core restaurant data adapters are still in-memory; workflow orchestration has SQL-backed durable persistence.
-- End-to-end order-fulfillment side effects are not fully restart-durable until order, payment, and inventory ports are backed by durable storage.
-- The final workflow message publisher is currently in-memory; the SQL outbox is durable, but production event delivery still needs a broker adapter.
+## 3. Persistence Design
 
-## 3. Hexagonal Architecture Compliance
+Core restaurant state is SQL-backed through
+`src/Infrastructure/FnbPersistence/Sql/FnbTables.sql` and
+`SqlServerFnbRepository`:
 
-### What Is Compliant
+- restaurant profile, dining tables, menu items, orders, order lines, payments,
+  reservations, inventory items, and stock movements are persisted;
+- seeded data is deterministic, including 12 tables totaling 78 seats;
+- order creation, line updates, payment, inventory deduction/restoration, and
+  status updates use SQL transactions;
+- settled payment and stock movement natural keys make retrying those side
+  effects idempotent.
 
-- **Ports in Application**: ports are defined in `Hemi.Application` and are technology-agnostic.
-- **Adapters in Infrastructure**: distinct adapters implement outbound concerns for orders, reservations, payments, inventory, tables, menu, and profile.
-- **Durable workflow persistence**: SQL Server adapters implement workflow instance storage, execution logs, journaling, worker leases, and the workflow event outbox.
-- **Lease-fenced workflow commits**: journaled state, payload, step, and event transitions require the current workflow lease owner. Outbox publish/fail completion also requires the claiming lease owner.
-- **Framework isolation**: ASP.NET and DI remain in Presentation.
-- **Inward dependency direction**: Presentation/Infrastructure depend on Application; Application depends on Domain.
+Workflow state is SQL-backed through
+`src/Infrastructure/WorkflowPersistence/Sql/WorkflowTables.sql`:
 
-### What Is Partially Compliant
+- `WorkflowInstance` stores state, payload, idempotency metadata, retry
+  scheduling, and worker leases;
+- `WorkflowStepExecution` stores per-step execution attempts and compensation
+  outcomes;
+- `WorkflowOutboxMessage` stores lifecycle events with retry and outbox lease
+  fields.
 
-- Explicit adapter package naming (`Adapters.Api`, `Adapters.Persistence`) is still not represented as dedicated projects.
-- Domain remains mostly data-centric records rather than behavior-rich aggregates.
+The remaining external integration boundary is final event delivery:
+`IWorkflowMessagePublisher` is currently bound to
+`InMemoryWorkflowMessagePublisher`. Production should replace that binding with
+a broker adapter while retaining the SQL outbox and lease-fenced publisher.
 
-## 4. Domain Model Evaluation
+## 4. Hexagonal Compliance
 
-- Domain concepts present: restaurant profile, tables, menu, service orders/order lines, reservations, payments, inventory/stock movements, and sales report.
-- Seat-capacity suitability is represented (`60..80`) and seeded tables total 78 seats.
-- Domain behavior is still limited:
-  - Most transition rules live in application service or workflow steps.
-  - Entities are mostly immutable records with minimal domain methods.
+### Compliant
 
-## 5. FnB Functionality Coverage
+- Application defines technology-agnostic outbound ports for restaurant, table,
+  menu, order, reservation, payment, inventory, saga query, workflow instance,
+  workflow log, journal, outbox, event publishing, dispatching, registry, and
+  retry policy concerns.
+- Infrastructure implements the outbound adapters and depends inward on
+  Application.
+- Presentation depends on Application and Infrastructure for composition and
+  keeps endpoint handlers thin.
+- Domain has no dependency on outer layers.
+- SQL workflow commits are lease-fenced through `IWorkflowJournal`; fallback
+  instance-store state/payload updates are optimistic-versioned and can require
+  the active lease owner.
+
+### Partially Compliant
+
+- The folder/project names do not use a strict `Adapters.Api` /
+  `Adapters.Persistence` topology.
+- `FnbManagementService` is still a broad orchestration service rather than a
+  set of focused use-case handlers.
+- `SqlServerFnbRepository` implements many ports in one class. This is
+  acceptable at the current size, but it should be split by concern if it grows.
+- Domain objects are still mostly data-centric records; many lifecycle rules
+  live in the application service and workflow steps.
+- Final workflow message delivery is not production-integrated until a broker
+  adapter replaces the in-memory publisher.
+
+## 5. Functionality Coverage
 
 Required operational flow coverage:
 
-1. **Create order for table** - implemented.
-2. **Add/remove items** - implemented.
-3. **Send order to kitchen** - implemented.
-4. **Process payment** - implemented.
-5. **Deduct inventory** - implemented at order closing and in the fulfillment workflow.
-6. **Close order** - implemented with settled-payment guard.
+1. Create order for table - implemented with server-side price resolution.
+2. Add/remove items - implemented.
+3. Send order to kitchen - implemented.
+4. Process payment - implemented with retry-safe settled-payment persistence.
+5. Deduct inventory - implemented at order closing and in the fulfillment
+   workflow with retry-safe stock movements.
+6. Close order - implemented with settled-payment guard and table release.
+7. Basic reporting - implemented through the sales report endpoint.
 
-Additional required capability:
+Additional capabilities:
 
-- **Basic reporting** - implemented via sales report query endpoint.
+- reservation creation and upcoming reservation listing;
+- inventory snapshot endpoint;
+- food-app order intake endpoint;
+- generic workflow list/start/status endpoints under `/workflows`;
+- durable order fulfillment through the compatibility route
+  `/orders/{orderId}/fulfillment-saga`.
 
-Fulfillment hardening:
+## 6. Workflow Design
 
-- **Durable orchestrator path**: `POST /orders/{orderId}/fulfillment-saga` enqueues the `order-fulfillment` workflow despite the compatibility-oriented route name.
-- **SQL workflow state**: `WorkflowInstance`, `WorkflowStepExecution`, and `WorkflowOutboxMessage` track workflow state, step attempt history, and events.
-- **Explicit journal transitions**: workflow start, terminal workflow states, step starts/completions/failures, step compensation, and compensation failure use explicit journal entry types instead of a generic append contract.
-- **SQL schema gating**: the idempotent workflow schema is in `src/Infrastructure/WorkflowPersistence/Sql/WorkflowTables.sql`; SQL integration tests require `HEMI_TEST_SQLSERVER_CONNECTION_STRING`.
-- **Lease recovery**: workflow workers and outbox publishers claim due rows with SQL leases and allow expired leases to be reclaimed; those leases also act as fencing tokens for completion writes.
-- **Dispatch retry recovery**: non-terminal worker dispatch failures are rescheduled with `workflow.retry_scheduled`, lease clearing, and terminal failure after retry exhaustion.
-- **Idempotency**: idempotency keys, request hashes, and workflow/correlation uniqueness prevent duplicate or conflicting starts.
-- **Compensation**: failed workflows compensate completed kitchen, payment, and inventory steps in reverse order.
-- **Outbox**: workflow events are stored durably and published asynchronously from claimed outbox rows.
-- **Legacy saga boundary**: legacy saga code is retained for migration/read fallback only and is not the active fulfillment runtime.
+The order fulfillment workflow runs these steps:
 
-Hardening completed:
+1. `SendOrderToKitchenStep`
+2. `CaptureOrderPaymentStep`
+3. `DeductOrderInventoryStep`
+4. `CloseOrderStep`
 
-- Order creation now resolves prices server-side from menu catalog (client no longer supplies `UnitPrice`), reducing pricing-tampering risk.
+Current hardening includes:
 
-## 6. Dependency Direction Analysis
+- idempotent workflow starts with `IdempotencyKey`, `RequestHash`, and
+  `WorkflowId + CorrelationId` uniqueness;
+- worker lease recovery for due workflow instances;
+- journaled state, payload, step attempt, and outbox event transitions;
+- reverse-order compensation for completed kitchen, payment, and inventory
+  steps;
+- recoverable dispatch failures with retry scheduling and terminal failure
+  after retry exhaustion;
+- SQL outbox claiming, retry, failed/published terminal states, and lease
+  fencing;
+- workflow metrics and tracing through the `Hemi.Workflows` meter/activity
+  source.
+
+Legacy saga artifacts under `src/Application/Sagas/Legacy` and
+`src/Infrastructure/Persistence/SagaCoreTables.sql` are migration/read-fallback
+only. They are not the active execution runtime.
+
+## 7. Dependency Direction
 
 Observed project references:
 
 - `Application -> Domain`
 - `Infrastructure -> Application`
 - `Presentation -> Application + Infrastructure`
-- `Domain` has no reference to outer layers.
+- `Domain` has no project references.
 
-This preserves inward dependency flow and keeps framework/infrastructure concerns out of the domain layer.
+This preserves inward dependency flow and keeps ASP.NET, SQL Server, messaging,
+and hosting concerns outside the domain and application contracts.
 
-## 7. Code Quality Review
+## 8. Risks and Recommendations
 
-### Strengths
+1. Add a broker-backed `IWorkflowMessagePublisher` for production event delivery.
+2. Split `FnbManagementService` into focused use-case handlers as the restaurant
+   surface area grows.
+3. Split `SqlServerFnbRepository` by adapter concern if persistence logic
+   continues to expand.
+4. Move high-value lifecycle invariants into domain behavior where that reduces
+   duplication or ambiguity.
+5. Decide whether to keep the disabled root discovery endpoint or remove the
+   commented code entirely.
+6. Continue running SQL Server integration tests with
+   `HEMI_TEST_SQLSERVER_CONNECTION_STRING`, since those tests cover the
+   production persistence paths that unit tests skip.
+7. Keep legacy saga support read-only and remove it after migration needs expire.
 
-- DI registration is explicit and clear.
-- Async signatures are used across ports/services/adapters/endpoints.
-- Validation/guard clauses are present for critical flows.
-- Endpoint business logic remains thin and delegated to application service or workflow orchestration.
-- Workflow tests cover idempotent starts, lease claiming, workflow status, step attempt history, compensation, and outbox behavior.
+## 9. Overall Verdict
 
-### Risks / Quality Issues
-
-- SQL Server integration tests are gated by `HEMI_TEST_SQLSERVER_CONNECTION_STRING`, so they do not run unless a test database is explicitly supplied.
-- Core restaurant data adapters are still in-memory and not production-grade for concurrent restaurant operations.
-- Workflow state can recover across process restarts, but workflow step side effects currently depend on the in-memory restaurant adapters.
-- Direct `IWorkflowInstanceStore` state/payload update methods are optimistic-versioned fallback paths; production workflow execution should use the lease-fenced journal path.
-- The orchestration service remains large and could be split for maintainability.
-
-## 8. Identified Architectural Violations
-
-1. **Strict structure mismatch**: expected explicit `Adapters`/`Api` segmentation is not yet mirrored in project names/layout.
-2. **Anemic domain**: core lifecycle rules are still primarily outside domain entities.
-3. **Partial production persistence**: workflow orchestration has SQL durability, but core restaurant data still uses in-memory adapters.
-4. **Partial event delivery**: workflow outbox storage is durable, but the configured message publisher is in-memory.
-
-## 9. Recommended Refactoring
-
-1. **Add SQL-backed FnB adapters**
-   - Replace runtime in-memory bindings for orders, payments, inventory, reservations, menu, tables, and profile with durable SQL adapters.
-
-2. **Tighten remaining workflow mutation boundaries**
-   - Add lease-owner fencing to direct instance-store state/payload updates or confine those methods to non-production fallback/testing.
-   - Suppress duplicate `workflow.started` events when a reclaimed workflow already has persisted step attempts.
-
-3. **Complete production event delivery**
-   - Provide a broker-backed `IWorkflowMessagePublisher` while retaining SQL outbox claiming, retry, and fencing behavior.
-
-4. **Split orchestration into use-case handlers**
-   - `CreateOrder`, `AddOrderItem`, `SendOrderToKitchen`, `ProcessPayment`, `CloseOrder`, `GetSalesReport`, etc.
-
-5. **Move critical invariants into domain behavior**
-   - Add aggregate methods for valid transitions and invariant enforcement.
-
-6. **Clarify or remove inactive legacy surface**
-   - Keep legacy read fallback for migration but remove unused legacy execution interfaces and unused generic workflow orchestrator abstractions.
-
-7. **Keep expanding test suites**
-   - Broaden SQL-backed workflow tests and add production persistence tests as restaurant adapters move beyond memory.
-
-## 10. Overall Verdict
-
-**PARTIAL** - The repository has the core durable workflow orchestrator mechanics in place: SQL workflow state, explicit journaling, worker leases, outbox leases, compensation tracking, idempotent starts, and retry recovery. It is not yet fully implemented as an end-to-end production workflow architecture because restaurant side effects still use in-memory adapters, final message delivery is in-memory, and some direct instance-store fallback updates are not lease-owner fenced.
+**SUBSTANTIALLY ALIGNED** - The current codebase follows the intended
+layered/hexagonal direction and now has SQL-backed durability for both workflow
+state and core restaurant side effects. The main architecture gaps are no
+broker-backed final event delivery, broad application/repository classes that
+will need splitting as complexity grows, and a mostly data-centric domain model.

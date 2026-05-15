@@ -9,8 +9,9 @@ durable workflow definition.
 ## Runtime Path
 
 1. `POST /orders/{orderId}/fulfillment-saga` builds a `StartWorkflowCommand`.
-2. `WorkflowCommandQueue` persists or returns a `WorkflowInstance` through
-   `IWorkflowInstanceStore`.
+   The generic `POST /workflows/` endpoint uses the same command path.
+2. `WorkflowCommandQueue` validates the workflow registry, hashes the request,
+   and persists or returns a `WorkflowInstance` through `IWorkflowInstanceStore`.
 3. `WorkflowWorkerService` claims due workflow instances and dispatches them to
    `WorkflowDispatcher`.
 4. `WorkflowEngine` runs `OrderFulfillmentWorkflow` steps:
@@ -31,12 +32,22 @@ compatibility with historical saga rows.
 
 ## Current Implementation Boundary
 
-The workflow orchestration state is durable, but the current application host
-still uses in-memory restaurant adapters for orders, payments, inventory,
-tables, menu, and reservations. A workflow instance, step attempts, leases, and
-outbox events survive process restart through SQL Server; the restaurant side
-effects performed by workflow steps do not yet survive restart unless those
-ports are replaced by durable adapters.
+The application host uses SQL Server for both workflow state and the core FnB
+side effects by default. `SqlServerFnbRepository` implements the restaurant,
+table, menu, order, reservation, payment, and inventory ports against
+`ConnectionStrings:DefaultConnection`. The in-memory FnB adapters are retained
+for the `Testing` environment and for local demos when `Fnb:UseInMemory=true`.
+
+With both SQL schemas applied, workflow instances, step attempts, worker
+leases, outbox events, orders, payments, reservations, inventory, and stock
+movements survive process restart. The FnB repository uses SQL transactions,
+row locks where mutation ordering matters, and natural uniqueness constraints
+for retry safety:
+
+- `UX_FnbPayment_Order_Settled` prevents duplicate settled payments for an
+  order.
+- `UX_FnbStockMovement_Order_Inventory_Reason` prevents duplicate inventory
+  deduction or restoration movements for the same order/item/reason.
 
 The outbox itself is SQL-backed. `WorkflowOutboxPublisher` is the
 lease-fenced SQL outbox dispatcher, not the broker adapter. Its final delivery
@@ -70,6 +81,24 @@ SQL Server integration tests are intentionally gated behind
 `HEMI_TEST_SQLSERVER_CONNECTION_STRING`. Without that variable, the tests are
 skipped rather than creating or mutating a local database implicitly.
 
+## FnB SQL Schema
+
+The core restaurant schema lives in
+`src/Infrastructure/FnbPersistence/Sql/FnbTables.sql`.
+
+It creates and idempotently seeds:
+
+- `FnbRestaurantProfile`: Hemi Steak & Seafood Grill profile and 60-80 seat
+  capacity target.
+- `FnbDiningTable`: 12 deterministic table rows totaling 78 seats.
+- `FnbMenuItem`: menu catalog and availability flags.
+- `FnbServiceOrder` and `FnbOrderLine`: order header and normalized line items.
+- `FnbPayment`: settled/refunded payment records with a unique settled-payment
+  guard per order.
+- `FnbReservation`: upcoming reservation records.
+- `FnbInventoryItem` and `FnbStockMovement`: inventory balances and idempotent
+  order-related stock movements.
+
 ## Idempotency and Correlation
 
 Workflow starts are durable and idempotent:
@@ -99,9 +128,11 @@ the current lease owner. A worker that no longer owns the row cannot complete a
 journal commit after another worker has reclaimed the workflow.
 
 The direct `IWorkflowInstanceStore` state/payload mutation methods remain as a
-fallback path and are optimistic-versioned. Production workflow execution should
-prefer `IWorkflowJournal` so transition commits are both version- and
-lease-fenced.
+fallback path. They are optimistic-versioned and accept an expected lease owner;
+the current runtime passes the active lease owner when it falls back to those
+methods. Production workflow execution should still prefer `IWorkflowJournal`
+because it commits state, payload, step attempt, and event changes in one
+version- and lease-fenced transition.
 
 The outbox uses the same model. `WorkflowOutboxPublisher` claims pending
 messages with a lease owner and lease expiry, publishes only claimed messages,
@@ -139,6 +170,14 @@ transient failures, and marks exhausted messages as failed only while it still
 owns the outbox lease. Broker-specific delivery code should live behind
 `IWorkflowMessagePublisher`; it should not bypass the SQL outbox claim, retry,
 or lease-fencing path.
+
+## Observability
+
+Workflow instrumentation is centralized in `WorkflowMetrics` and
+`WorkflowTracing`. Metrics are emitted through the `Hemi.Workflows` meter for
+workflow events, command handling, and message publishing outcomes. Tracing uses
+the `Hemi.Workflows` activity source for workflow command handling and workflow
+event publication.
 
 ## Recoverable Worker Dispatch Failures
 
