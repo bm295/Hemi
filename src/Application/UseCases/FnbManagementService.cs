@@ -15,6 +15,8 @@ public sealed class FnbManagementService(
     IPaymentQueryPort paymentQueryPort,
     IPaymentCommandPort paymentCommandPort)
 {
+    public FnbBusinessCore GetBusinessCore() => HemiFnbCore.Current;
+
     public Task<RestaurantProfile> GetProfileAsync(CancellationToken cancellationToken = default) =>
         restaurantQueryPort.GetRestaurantProfileAsync(cancellationToken);
 
