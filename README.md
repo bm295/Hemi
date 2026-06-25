@@ -17,6 +17,16 @@ This repository now contains a layered C# application for **Hemi Steak & Seafood
   - Infrastructure (SQL FnB repository, in-memory test overrides, SQL workflow persistence, SQL outbox, and monitoring)
   - Domain (entities and value objects)
 
+## Core FnB business module
+
+The Domain project now exposes `HemiFnbCore.Current` as the canonical FnB business core for Hemi Steak & Seafood Grill. It centralizes:
+
+- the restaurant operating profile and 60-80 seat capacity target
+- business areas for restaurant operations, front-of-house, menu, orders, kitchen, payments, inventory, reservations, reporting, integrations, and workflow reliability
+- a requirement catalog (`REQ-*`) with acceptance criteria
+- a capability map linking each requirement to an owning FnB module
+- service policies for pricing authority, payment-before-close, capacity, and retry-safe side effects
+
 ## Features implemented
 
 - Restaurant profile and seating capacity range
