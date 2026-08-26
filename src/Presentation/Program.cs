@@ -7,6 +7,7 @@ using Hemi.Application.Workflows.Definitions.OrderFulfillment.Compensations;
 using Hemi.Application.Workflows.Definitions.OrderFulfillment.Steps;
 using Hemi.Application.Workflows.Execution;
 using Hemi.Application.Workflows.Registry;
+using Hemi.Application.Workflows.Queries;
 using Hemi.Domain;
 using Hemi.Domain.Workflows;
 using Hemi.Infrastructure;
@@ -38,6 +39,7 @@ builder.Services.AddSingleton<ISagaStateQueryPort>(sp => sp.GetRequiredService<S
 
 builder.Services.AddSingleton<LegacyOrderFulfillmentSagaQueryService>();
 builder.Services.AddSingleton<FnbManagementService>();
+builder.Services.AddSingleton<WorkflowStatusQueryService>();
 
 builder.Services.AddSingleton(_ => new WorkflowInstanceRepository(connectionString));
 builder.Services.AddSingleton<IWorkflowInstanceStore>(sp =>
@@ -294,7 +296,7 @@ app.MapPost("/orders/{orderId:guid}/fulfillment-saga", async (
 app.MapGet("/orders/{orderId:guid}/fulfillment-saga", async (
     Guid orderId,
     IWorkflowInstanceStore workflowInstanceStore,
-    IWorkflowExecutionLogStore workflowExecutionLogStore,
+    WorkflowStatusQueryService workflowStatusQueryService,
     LegacyOrderFulfillmentSagaQueryService legacySagaQueryService,
     CancellationToken cancellationToken) =>
 {
@@ -306,9 +308,8 @@ app.MapGet("/orders/{orderId:guid}/fulfillment-saga", async (
 
     if (instance is not null)
     {
-        var response = await WorkflowStatusMapper.ToStatusResponseAsync(
+        var response = await workflowStatusQueryService.GetStatusAsync(
             instance,
-            workflowExecutionLogStore,
             cancellationToken);
 
         return Results.Ok(response);
