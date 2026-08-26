@@ -30,6 +30,12 @@ It falls back to `LegacyOrderFulfillmentSagaQueryService` only when no workflow
 instance exists for that order. That fallback is for migration and read
 compatibility with historical saga rows.
 
+Both the order-specific and generic status endpoints delegate step-attempt
+selection and payload projection to the application-layer
+`WorkflowStatusQueryService`. The presentation layer is responsible only for
+HTTP lookup and response selection; it does not coordinate workflow execution
+log details.
+
 ## Current Implementation Boundary
 
 The application host uses SQL Server for both workflow state and the core FnB

@@ -2,16 +2,21 @@ using System.Text.Json;
 using Hemi.Application.Workflows.Abstractions;
 using Hemi.Application.Workflows.Contracts;
 
-namespace Hemi.Presentation.Endpoints;
+namespace Hemi.Application.Workflows.Queries;
 
-public static class WorkflowStatusMapper
+/// <summary>
+/// Builds the application-level status projection for a persisted workflow.
+/// Keeping this projection here prevents HTTP endpoints from coordinating
+/// workflow persistence details themselves.
+/// </summary>
+public sealed class WorkflowStatusQueryService(
+    IWorkflowExecutionLogStore workflowExecutionLogStore)
 {
     private static readonly JsonSerializerOptions SerializerOptions =
         new(JsonSerializerDefaults.Web);
 
-    public static async Task<WorkflowStatusResponse> ToStatusResponseAsync(
+    public async Task<WorkflowStatusResponse> GetStatusAsync(
         WorkflowInstanceRecord instance,
-        IWorkflowExecutionLogStore workflowExecutionLogStore,
         CancellationToken cancellationToken = default)
     {
         var attempts = await workflowExecutionLogStore.GetStepAttemptsAsync(

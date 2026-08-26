@@ -1,5 +1,6 @@
 using Hemi.Application.Workflows.Abstractions;
 using Hemi.Application.Workflows.Contracts;
+using Hemi.Application.Workflows.Queries;
 using Hemi.Presentation.BackgroundWorkers;
 
 namespace Hemi.Presentation.Endpoints;
@@ -43,7 +44,7 @@ public static class WorkflowsEndpoints
             string workflowId,
             string correlationId,
             IWorkflowInstanceStore workflowInstanceStore,
-            IWorkflowExecutionLogStore workflowExecutionLogStore,
+            WorkflowStatusQueryService workflowStatusQueryService,
             CancellationToken cancellationToken) =>
         {
             var instance = await workflowInstanceStore.GetInstanceByCorrelationAsync(
@@ -60,9 +61,8 @@ public static class WorkflowsEndpoints
                     CorrelationId: correlationId));
             }
 
-            var response = await WorkflowStatusMapper.ToStatusResponseAsync(
+            var response = await workflowStatusQueryService.GetStatusAsync(
                 instance,
-                workflowExecutionLogStore,
                 cancellationToken);
 
             return Results.Ok(response);
