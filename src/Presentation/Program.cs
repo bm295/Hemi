@@ -24,8 +24,10 @@ var builder = WebApplication.CreateBuilder(args);
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
     ?? "Server=localhost;Database=HemiFnb;Trusted_Connection=True;TrustServerCertificate=True;";
 
-if (builder.Environment.IsEnvironment("Testing") ||
-    IsEnabled(builder.Configuration["Fnb:UseInMemory"]))
+var useInMemoryFnb = builder.Environment.IsEnvironment("Testing") ||
+    IsEnabled(builder.Configuration["Fnb:UseInMemory"]);
+
+if (useInMemoryFnb)
 {
     AddInMemoryFnbPersistence(builder.Services);
 }
@@ -89,8 +91,11 @@ builder.Services.AddSingleton<WorkflowOutboxPublisher>();
 builder.Services.AddSingleton<IWorkflowEventPublisher, OutboxWorkflowEventPublisher>();
 builder.Services.AddSingleton<WorkflowCommandQueue>();
 builder.Services.AddScoped<WorkflowCommandSubscriber>();
-builder.Services.AddHostedService<WorkflowWorkerService>();
-builder.Services.AddHostedService<WorkflowOutboxPublisherService>();
+if (!useInMemoryFnb)
+{
+    builder.Services.AddHostedService<WorkflowWorkerService>();
+    builder.Services.AddHostedService<WorkflowOutboxPublisherService>();
+}
 
 var app = builder.Build();
 

@@ -11,6 +11,7 @@ This repository now contains a layered C# application for **Hemi Steak & Seafood
 
 - **C# 14**
 - **.NET 10** (`net10.0`)
+- **Angular 22** standalone web client in `client/`
 - Layered architecture:
   - Presentation (Minimal API)
   - Application (use-case service, workflow runtime, workflow registry, and ports)
@@ -51,6 +52,27 @@ The Domain project now exposes `HemiFnbCore.Current` as the canonical FnB busine
 - SQL-backed restaurant profile, tables, menu, orders, payments, reservations, inventory, and stock movements
 
 ## Run
+
+### Web client (local demo)
+
+In one terminal, start the API with in-memory restaurant data:
+
+```powershell
+$env:Fnb__UseInMemory='true'
+dotnet run --project src/Presentation/Hemi.Presentation.csproj --no-launch-profile --urls http://localhost:55722
+```
+
+In another terminal, start Angular:
+
+```powershell
+cd client
+npm ci
+npm start
+```
+
+Open `http://localhost:4200`. The Angular dev server proxies `/api` to `http://localhost:55722`. The client offers an operations overview, order creation and checkout, reservation entry, and an inventory snapshot. For a SQL-backed run, apply the schemas below and start the API without `Fnb__UseInMemory`. In-memory data resets when the API restarts.
+
+### API and SQL setup
 
 Apply the SQL schemas before running against SQL Server:
 

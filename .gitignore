@@ -1,4 +1,7 @@
 # Build output
+node_modules/
+client/.angular/
+client/dist/
 bin/
 obj/
 out/
