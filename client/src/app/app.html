@@ -11,7 +11,7 @@
     <div class="sidebar-foot"><span class="status-dot"></span> Restaurant dashboard <small>Live API data</small></div>
   </aside>
   <main class="main">
-    <header class="topbar"><div><span class="eyebrow">HEMI / OPERATIONS</span><h1>{{ view() === 'overview' ? 'Overview' : view() === 'orders' ? 'Orders' : view() === 'reservations' ? 'Reservations' : 'Inventory' }}</h1><p>{{ now | date:'EEEE, d MMMM y' }}</p></div><button class="refresh" (click)="refresh()" [disabled]="loading() || busy()">↻ &nbsp; Refresh</button></header>
+    <header class="topbar"><div><span class="eyebrow">HEMI / OPERATIONS</span><h1>{{ view() === 'overview' ? 'Overview' : view() === 'orders' ? 'Orders' : view() === 'reservations' ? 'Reservations' : view() === 'inventory' ? 'Inventory' : 'ML Lab' }}</h1><p>{{ now | date:'EEEE, d MMMM y' }}</p></div><button class="refresh" (click)="refresh()" [disabled]="loading() || busy()">↻ &nbsp; Refresh</button></header>
     @if (error()) { <div class="alert error" role="alert">{{ error() }}</div> }
     @if (notice()) { <div class="alert success" role="status">{{ notice() }}</div> }
     @if (loading() && !tables().length) { <div class="loading">Loading restaurant data…</div> }
@@ -37,6 +37,28 @@
       }
       @if (view() === 'reservations') {
         <div class="page-grid"><section class="panel form-panel"><div class="panel-head"><div><span class="eyebrow">BOOK A TABLE</span><h2>New reservation</h2></div></div><form (ngSubmit)="createReservation()"><label>Guest name<input name="guestName" [(ngModel)]="newReservation.guestName" required placeholder="Full name"></label><label>Phone number<input name="contactPhone" [(ngModel)]="newReservation.contactPhone" required placeholder="Contact number"></label><div class="form-row"><label>Party size<input type="number" name="partySize" [(ngModel)]="newReservation.partySize" min="1" required></label><label>Date & time<input type="datetime-local" name="reservedFor" [(ngModel)]="newReservation.reservedFor" required></label></div><label>Notes <span class="optional">optional</span><textarea name="notes" [(ngModel)]="newReservation.notes" rows="3" placeholder="Special requests"></textarea></label><button class="primary" type="submit" [disabled]="busy() || !newReservation.guestName || !newReservation.contactPhone || !newReservation.reservedFor">Create reservation</button></form></section><section class="panel"><div class="panel-head"><div><span class="eyebrow">GUEST LIST</span><h2>Upcoming <span class="count">{{ reservations().length }}</span></h2></div></div>@for (reservation of reservations(); track reservation.id) { <div class="reservation-row"><div class="date-box"><strong>{{ reservation.reservedFor | date:'d' }}</strong><small>{{ reservation.reservedFor | date:'MMM' }}</small></div><div class="row-copy"><strong>{{ reservation.guestName }}</strong><small>{{ reservation.reservedFor | date:'h:mm a' }} · {{ reservation.partySize }} guests · {{ reservation.contactPhone }}</small>@if (reservation.notes) { <p>{{ reservation.notes }}</p> }</div><span class="badge">{{ reservationStatus(reservation.status) }}</span></div> } @empty { <p class="empty">No upcoming reservations.</p> }</section></div>
+      }
+      @if (view() === 'ml') {
+        <section class="panel">
+          <div class="panel-head"><div><span class="eyebrow">SUPERVISED LEARNING · DEMO DATA</span><h2>Daily sales demand prediction</h2></div></div>
+          <p>Train two regression models on 120 synthetic daily sales records. Chronological split: 70% train, 15% validation, 15% untouched test.</p>
+          <button class="primary" (click)="trainDemoDemand()" [disabled]="busy()">Train and evaluate</button>
+          @if (demandResult(); as result) {
+            <p>Train: {{ result.trainingCount }} · Validation: {{ result.validationCount }} · Test: {{ result.testCount }}</p>
+            <p>Selected using validation MAE: <strong>{{ result.selectedModel }}</strong></p>
+            @for (candidate of result.candidates; track candidate.name) {
+              <p>{{ candidate.name }} — training MAE: {{ candidate.training.mae | number:'1.2-2' }}; validation MAE: {{ candidate.validation.mae | number:'1.2-2' }}</p>
+            }
+            <p>Held-out test MAE: {{ result.test.mae | number:'1.2-2' }} · RMSE: {{ result.test.rmse | number:'1.2-2' }} · R²: {{ result.test.rSquared | number:'1.2-2' }}</p>
+            <p>{{ result.possibleOverfitting ? 'Possible overfitting: validation error substantially exceeds training error.' : 'No large training/validation gap detected by the demo heuristic.' }}</p>
+            <form (ngSubmit)="predictDemoDemand()">
+              <label>Forecast date<input type="date" name="forecastDate" [(ngModel)]="forecastDate" required></label>
+              <label>Unit price<input type="number" name="forecastPrice" [(ngModel)]="forecastPrice" min="1" required></label>
+              <button class="primary" type="submit" [disabled]="busy()">Predict demand</button>
+            </form>
+            @if (demandPrediction() !== null) { <p>Predicted units: <strong>{{ demandPrediction() | number:'1.1-1' }}</strong></p> }
+          }
+        </section>
       }
       @if (view() === 'inventory') {
         <section class="panel"><div class="panel-head"><div><span class="eyebrow">STOCK CONTROL</span><h2>Inventory snapshot</h2></div><span class="subtle">{{ inventory().length }} items · {{ lowStock().length }} low stock</span></div><div class="inventory-head"><span>ITEM</span><span>ON HAND</span><span>STATUS</span></div>@for (item of inventory(); track item.id) { <div class="inventory-row"><div><strong>{{ item.name }}</strong><small>{{ menuName(item.menuItemId) }}</small></div><strong>{{ item.stockQuantity | number:'1.0-2' }} {{ item.unit }}</strong><span class="badge" [class.low]="item.stockQuantity <= 10">{{ item.stockQuantity <= 10 ? 'Low stock' : 'In stock' }}</span></div> } @empty { <p class="empty">No inventory items found.</p> }</section>
