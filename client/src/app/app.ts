@@ -34,6 +34,41 @@ export class App implements OnInit {
   readonly inventory = signal<InventoryItem[]>([]);
   readonly sales = signal<SalesReport | null>(null);
   readonly now = new Date();
+  readonly mlResult = signal<any>(null);
+  readonly mlPrediction = signal<any>(null);
+  readonly mlBusy = signal(false);
+  readonly mlError = signal('');
+  readonly mlItemId = '11111111-1111-1111-1111-111111111111';
+  mlDate = '2026-05-01';
+  mlPrice = 120000;
+
+  async trainMl(): Promise<void> {
+    this.mlBusy.set(true);
+    this.mlError.set('');
+    try {
+      const observations = Array.from({ length: 120 }, (_, i) => {
+        const date = new Date(Date.UTC(2026, 0, 1 + i));
+        const weekend = date.getUTCDay() === 0 || date.getUTCDay() === 6;
+        return { date: date.toISOString().slice(0, 10), menuItemId: this.mlItemId,
+          unitPrice: 120000, quantity: 12 + (weekend ? 9 : 0) + Math.floor(i / 20) + i % 5 };
+      });
+      this.mlResult.set(await firstValueFrom(this.http.post('/api/ml/demand/train',
+        { menuItemId: this.mlItemId, observations })));
+      this.mlPrediction.set(null);
+    } catch (error) { this.mlError.set(this.message(error)); }
+    finally { this.mlBusy.set(false); }
+  }
+
+  async predictMl(): Promise<void> {
+    this.mlBusy.set(true);
+    this.mlError.set('');
+    try {
+      this.mlPrediction.set(await firstValueFrom(this.http.post('/api/ml/demand/predict',
+        { menuItemId: this.mlItemId, date: this.mlDate, unitPrice: this.mlPrice })));
+    } catch (error) { this.mlError.set(this.message(error)); }
+    finally { this.mlBusy.set(false); }
+  }
+
   readonly demandResult = signal<DemandResult | null>(null);
   readonly demandPrediction = signal<number | null>(null);
   readonly demoItemId = '11111111-1111-1111-1111-111111111111';
