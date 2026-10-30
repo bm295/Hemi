@@ -13,6 +13,7 @@ using Hemi.Domain.Workflows;
 using Hemi.Infrastructure;
 using Hemi.Infrastructure.Messaging;
 using Hemi.Infrastructure.MachineLearning;
+using Hemi.Infrastructure.MachineLearning;
 using Hemi.Infrastructure.Monitoring;
 using Hemi.Infrastructure.WorkflowPersistence.Repositories;
 using Hemi.Presentation.BackgroundWorkers;
@@ -42,6 +43,7 @@ builder.Services.AddSingleton<ISagaStateQueryPort>(sp => sp.GetRequiredService<S
 
 builder.Services.AddSingleton<LegacyOrderFulfillmentSagaQueryService>();
 builder.Services.AddSingleton<FnbManagementService>();
+builder.Services.AddSingleton<DemandForecastingService>();
 builder.Services.AddSingleton<DemandForecastingService>();
 builder.Services.AddSingleton<WorkflowStatusQueryService>();
 
@@ -368,6 +370,7 @@ app.MapPost("/integrations/food-app/orders", async (IntegrateFoodAppOrderApiRequ
 });
 
 app.MapWorkflowsEndpoints();
+app.MapDemandForecastingEndpoints();
 app.MapDemandForecastingEndpoints();
 
 app.Run();
