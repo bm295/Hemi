@@ -11,7 +11,8 @@ interface ServiceOrder { id: string; tableId: string; createdAt: string; status:
 interface Reservation { id: string; guestName: string; partySize: number; reservedFor: string; contactPhone: string; notes: string | null; status: number }
 interface InventoryItem { id: string; menuItemId: string; name: string; stockQuantity: number; unit: string }
 interface SalesReport { totalRevenue: number; settledPayments: number; closedOrders: number }
-type View = 'overview' | 'orders' | 'reservations' | 'inventory';
+type View = 'overview' | 'orders' | 'reservations' | 'inventory' | 'ml';
+interface DemandResult { trainingCount: number; validationCount: number; testCount: number; selectedModel: string; possibleOverfitting: boolean; candidates: { name: string; training: { mae: number }; validation: { mae: number } }[]; test: { mae: number; rmse: number; rSquared: number } }
 
 @Component({
   selector: 'app-root',
@@ -33,6 +34,34 @@ export class App implements OnInit {
   readonly inventory = signal<InventoryItem[]>([]);
   readonly sales = signal<SalesReport | null>(null);
   readonly now = new Date();
+  readonly demandResult = signal<DemandResult | null>(null);
+  readonly demandPrediction = signal<number | null>(null);
+  readonly demoItemId = '11111111-1111-1111-1111-111111111111';
+  forecastDate = '2026-05-01';
+  forecastPrice = 120000;
+
+  async trainDemoDemand(): Promise<void> {
+    this.busy.set(true); this.error.set('');
+    try {
+      const observations = Array.from({ length: 120 }, (_, i) => {
+        const date = new Date(Date.UTC(2026, 0, 1 + i));
+        const weekend = date.getUTCDay() === 0 || date.getUTCDay() === 6;
+        return { date: date.toISOString().slice(0, 10), menuItemId: this.demoItemId, unitPrice: 120000, quantity: 12 + (weekend ? 9 : 0) + (i % 5) };
+      });
+      const result = await firstValueFrom(this.http.post<DemandResult>('/api/ml/demand/train', { menuItemId: this.demoItemId, observations }));
+      this.demandResult.set(result); this.demandPrediction.set(null);
+    } catch (error) { this.error.set(this.message(error)); }
+    finally { this.busy.set(false); }
+  }
+
+  async predictDemoDemand(): Promise<void> {
+    this.busy.set(true); this.error.set('');
+    try {
+      const result = await firstValueFrom(this.http.post<{ predictedQuantity: number }>('/api/ml/demand/predict', { menuItemId: this.demoItemId, date: this.forecastDate, unitPrice: this.forecastPrice }));
+      this.demandPrediction.set(result.predictedQuantity);
+    } catch (error) { this.error.set(this.message(error)); }
+    finally { this.busy.set(false); }
+  }
 
   newOrder = { tableId: '', menuItemId: '', quantity: 1 };
   newReservation = { guestName: '', partySize: 2, reservedFor: '', contactPhone: '', notes: '' };
