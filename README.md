@@ -134,3 +134,14 @@ Current durability boundary:
 - `IWorkflowMessagePublisher` is the final delivery boundary and is currently bound to `InMemoryWorkflowMessagePublisher` for local/demo use because no real broker is specified. Production should replace that DI binding with a broker adapter while retaining the SQL outbox, `OutboxWorkflowEventPublisher`, lease-fenced `WorkflowOutboxPublisher`, and hosted outbox publisher service.
 
 More detail: `docs/durable-workflow-orchestrator.md`.
+
+## Supervised learning lab
+
+An independent Python console lab covers daily menu-sales regression, chronological train/validation/test splits, baseline comparisons, and an overfitting experiment. Start with the [Vietnamese lab guide](labs/Hemi.MachineLearning/README.md).
+
+```bash
+python -m pip install -r labs/Hemi.MachineLearning/requirements.txt
+python labs/Hemi.MachineLearning/lab.py
+```
+
+The default dataset is synthetic and educational. The lab also accepts a complete daily-sales CSV exported from Hemi; it does not change the .NET application's runtime.
